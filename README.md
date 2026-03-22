@@ -1,5 +1,11 @@
 # modern-fetch-stream
 
+[![npm version](https://img.shields.io/npm/v/modern-fetch-stream)](https://www.npmjs.com/package/modern-fetch-stream)
+[![npm downloads](https://img.shields.io/npm/dm/modern-fetch-stream)](https://www.npmjs.com/package/modern-fetch-stream)
+[![bundle size](https://img.shields.io/bundlephobia/minzip/modern-fetch-stream)](https://bundlephobia.com/package/modern-fetch-stream)
+[![license](https://img.shields.io/npm/l/modern-fetch-stream)](https://github.com/AIEPhoenix/modern-fetch-stream/blob/main/LICENSE)
+[![TypeScript](https://img.shields.io/badge/TypeScript-ready-blue)](https://www.typescriptlang.org/)
+
 A lightweight Server-Sent Events client built on the Fetch API. API-compatible with [`@microsoft/fetch-event-source`](https://github.com/Azure/fetch-event-source), with SSE parsing delegated to the spec-compliant [`eventsource-parser`](https://github.com/rexxars/eventsource-parser).
 
 ## Why
