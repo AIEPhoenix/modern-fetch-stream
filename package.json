@@ -1,0 +1,57 @@
+{
+  "name": "modern-fetch-stream",
+  "version": "0.1.0",
+  "description": "Modern, robust Server-Sent Events client built on fetch API and eventsource-parser",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsup",
+    "check": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "eventsource-parser": "^3.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "vitest": "^3.0.0",
+    "tsup": "^8.0.0"
+  },
+  "keywords": [
+    "sse",
+    "server-sent-events",
+    "eventsource",
+    "fetch",
+    "streaming",
+    "typescript"
+  ],
+  "author": "AIEPhoenix <aiephoenixbl@gmail.com>",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AIEPhoenix/modern-fetch-stream.git"
+  },
+  "bugs": {
+    "url": "https://github.com/AIEPhoenix/modern-fetch-stream/issues"
+  },
+  "homepage": "https://github.com/AIEPhoenix/modern-fetch-stream#readme"
+}
