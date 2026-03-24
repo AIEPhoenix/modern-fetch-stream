@@ -1,6 +1,6 @@
 {
   "name": "modern-fetch-stream",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Modern, robust Server-Sent Events client built on fetch API and eventsource-parser",
   "type": "module",
   "exports": {

@@ -1,6 +1,7 @@
 import { EventSourceParserStream } from 'eventsource-parser/stream'
 import { EventStreamContentType } from './errors'
 import { setupVisibility } from './visibility'
+import { ReceiveState } from './types'
 import type { FetchEventSourceInit } from './types'
 
 const DefaultRetryInterval = 1000
@@ -40,15 +41,19 @@ export function fetchEventSource(
   }: FetchEventSourceInit,
 ) {
   return new Promise<void>((resolve, reject) => {
-    // Copy headers so we can safely mutate (e.g. appending last-event-id).
-    const headers = { ...inputHeaders }
+    // Copy headers with lowercase keys so lookups are case-insensitive.
+    const headers: Record<string, string> = {}
+    for (const [key, value] of Object.entries(inputHeaders ?? {})) {
+      headers[key.toLowerCase()] = value
+    }
     if (!headers.accept) {
       headers.accept = EventStreamContentType
     }
 
     let curRequestController: AbortController
     let retryInterval = DefaultRetryInterval
-    let retryTimer = 0
+    let retryTimer: ReturnType<typeof setTimeout> | undefined
+    let receiveState: ReceiveState = ReceiveState.IDLE
 
     // In browser environments, close the connection when the page is hidden
     // and reopen it when the page becomes visible again — unless the caller
@@ -71,7 +76,7 @@ export function fetchEventSource(
     inputSignal?.addEventListener('abort', () => {
       dispose()
       resolve()
-    })
+    }, { once: true })
 
     const fetch = inputFetch ?? globalThis.fetch
     const onopen = inputOnOpen ?? defaultOnOpen
@@ -82,19 +87,28 @@ export function fetchEventSource(
      * schedules itself to run again after `retryInterval` ms.
      */
     async function create() {
-      curRequestController = new AbortController()
+      // Capture a local reference so the catch block checks the correct
+      // controller even if a new create() call overwrites curRequestController
+      // (e.g. rapid visibility toggles).
+      const controller = new AbortController()
+      curRequestController = controller
+      receiveState = ReceiveState.IDLE
       try {
         const response = await fetch(input, {
           ...rest,
           headers,
-          signal: curRequestController.signal,
+          signal: controller.signal,
         })
 
         await onopen(response)
 
+        if (!response.body) {
+          throw new Error('Response body is null')
+        }
+
         // Build the streaming pipeline:
         //   raw bytes → text chunks → parsed SSE messages
-        const eventStream = response.body!
+        const eventStream = response.body
           .pipeThrough(new TextDecoderStream())
           .pipeThrough(
             new EventSourceParserStream({
@@ -116,8 +130,15 @@ export function fetchEventSource(
             if (event.id !== undefined) {
               if (event.id) {
                 headers[LastEventId] = event.id
+                receiveState = ReceiveState.RECEIVED
               } else {
                 delete headers[LastEventId]
+                receiveState = ReceiveState.RECEIVED_NO_ID
+              }
+            } else {
+              // Message without id field at all
+              if (receiveState === ReceiveState.IDLE) {
+                receiveState = ReceiveState.RECEIVED_NO_ID
               }
             }
 
@@ -128,20 +149,20 @@ export function fetchEventSource(
         }
 
         // Stream ended cleanly — notify the caller and resolve.
-        onclose?.()
+        onclose?.(receiveState)
         dispose()
         resolve()
       } catch (err) {
         // If we aborted the request ourselves (visibility change, caller
         // signal, etc.) there is nothing to retry — just bail out.
-        if (!curRequestController.signal.aborted) {
+        if (!controller.signal.aborted) {
           try {
             // Let the caller decide the retry interval. Returning a number
             // overrides the default; returning nothing keeps it; throwing
             // aborts the whole operation.
-            const interval: any = onerror?.(err) ?? retryInterval
+            const interval = onerror?.(err, receiveState) ?? retryInterval
             clearTimeout(retryTimer)
-            retryTimer = setTimeout(create, interval) as any
+            retryTimer = setTimeout(create, interval)
           } catch (innerErr) {
             dispose()
             reject(innerErr)

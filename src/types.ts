@@ -3,6 +3,21 @@ import type { EventSourceMessage } from 'eventsource-parser'
 export type { EventSourceMessage }
 
 /**
+ * Describes the data receive state of the SSE stream at close time.
+ *
+ * - `IDLE`            — connection opened but no messages received yet.
+ * - `RECEIVED`        — at least one message carried an `id`; `last-event-id` is set.
+ * - `RECEIVED_NO_ID`  — messages were received but `last-event-id` is unset
+ *                        (either no message had an `id`, or it was explicitly cleared
+ *                        by the server sending an empty `id:` field).
+ */
+export enum ReceiveState {
+  IDLE = 'IDLE',
+  RECEIVED = 'RECEIVED',
+  RECEIVED_NO_ID = 'RECEIVED_NO_ID',
+}
+
+/**
  * Options for {@link fetchEventSource}. Extends the standard `RequestInit`
  * with SSE-specific lifecycle callbacks and retry control.
  *
@@ -41,8 +56,10 @@ export interface FetchEventSourceInit extends Omit<RequestInit, 'headers'> {
    * Called when the response stream closes gracefully. If you do not
    * expect the server to end the connection, throw inside this callback
    * to trigger a retry via `onerror`.
+   *
+   * The parameter is the final {@link StreamStatus} at the time of close.
    */
-  onclose?: () => void
+  onclose?: (receiveState: ReceiveState) => void
 
   /**
    * Called on any error — network failures, non-2xx responses, stream
@@ -55,8 +72,10 @@ export interface FetchEventSourceInit extends Omit<RequestInit, 'headers'> {
    * - **Rethrow / throw** — abort permanently; the returned promise rejects.
    *
    * When this callback is omitted, every error is treated as retriable.
+   *
+   * The second parameter is the current {@link ReceiveState}.
    */
-  onerror?: (err: any) => number | null | undefined | void
+  onerror?: (err: any, receiveState: ReceiveState) => number | undefined | void
 
   /**
    * By default the connection is closed when the page becomes hidden
