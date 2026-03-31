@@ -1,6 +1,9 @@
-const isBrowser =
-  typeof document !== 'undefined' &&
-  typeof document.addEventListener === 'function'
+function isBrowser() {
+  return (
+    typeof document !== "undefined" &&
+    typeof document.addEventListener === "function"
+  );
+}
 
 /**
  * Subscribe to page visibility changes in browser environments.
@@ -12,16 +15,16 @@ export function setupVisibility(
   onHidden: () => void,
   onVisible: () => void,
 ): () => void {
-  if (!isBrowser) return () => {}
+  if (!isBrowser()) return () => {};
 
   const handler = () => {
     if (document.hidden) {
-      onHidden()
+      onHidden();
     } else {
-      onVisible()
+      onVisible();
     }
-  }
+  };
 
-  document.addEventListener('visibilitychange', handler)
-  return () => document.removeEventListener('visibilitychange', handler)
+  document.addEventListener("visibilitychange", handler);
+  return () => document.removeEventListener("visibilitychange", handler);
 }

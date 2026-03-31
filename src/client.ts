@@ -1,11 +1,11 @@
-import { EventSourceParserStream } from 'eventsource-parser/stream'
-import { EventStreamContentType } from './errors'
-import { setupVisibility } from './visibility'
-import { ReceiveState } from './types'
-import type { FetchEventSourceInit } from './types'
+import { EventSourceParserStream } from "eventsource-parser/stream";
+import { EventStreamContentType } from "./errors";
+import { setupVisibility } from "./visibility";
+import { ReceiveState } from "./types";
+import type { FetchEventSourceInit } from "./types";
 
-const DefaultRetryInterval = 1000
-const LastEventId = 'last-event-id'
+const DefaultRetryInterval = 1000;
+const LastEventId = "last-event-id";
 
 /**
  * A drop-in replacement for the browser `EventSource` API that uses the
@@ -41,19 +41,92 @@ export function fetchEventSource(
   }: FetchEventSourceInit,
 ) {
   return new Promise<void>((resolve, reject) => {
-    // Copy headers with lowercase keys so lookups are case-insensitive.
-    const headers: Record<string, string> = {}
-    for (const [key, value] of Object.entries(inputHeaders ?? {})) {
-      headers[key.toLowerCase()] = value
-    }
+    const headers: Record<string, string> = {};
+    copyHeaders(headers, input instanceof Request ? input.headers : undefined);
+    copyHeaders(headers, inputHeaders);
     if (!headers.accept) {
-      headers.accept = EventStreamContentType
+      headers.accept = EventStreamContentType;
     }
 
-    let curRequestController: AbortController
-    let retryInterval = DefaultRetryInterval
-    let retryTimer: ReturnType<typeof setTimeout> | undefined
-    let receiveState: ReceiveState = ReceiveState.IDLE
+    let curRequestController: AbortController | undefined;
+    let retryInterval = DefaultRetryInterval;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    let receiveState: ReceiveState = ReceiveState.IDLE;
+    let isCreating = false;
+    let pendingCreate = false;
+    let finished = false;
+
+    const externalSignals = [
+      input instanceof Request ? input.signal : undefined,
+      inputSignal,
+    ].filter((signal): signal is AbortSignal => signal !== undefined);
+
+    if (externalSignals.some((signal) => signal.aborted)) {
+      resolve();
+      return;
+    }
+
+    function clearRetryTimer() {
+      if (retryTimer !== undefined) {
+        clearTimeout(retryTimer);
+        retryTimer = undefined;
+      }
+    }
+
+    function abortCurrentRequest() {
+      curRequestController?.abort();
+      curRequestController = undefined;
+    }
+
+    function shouldWaitForVisibility() {
+      return (
+        !openWhenHidden && typeof document !== "undefined" && document.hidden
+      );
+    }
+
+    function stop() {
+      if (finished) return;
+
+      finished = true;
+      pendingCreate = false;
+      clearRetryTimer();
+      disposeVisibility();
+      for (const removeListener of removeAbortListeners) {
+        removeListener();
+      }
+      abortCurrentRequest();
+    }
+
+    function resolveOnce() {
+      stop();
+      resolve();
+    }
+
+    function rejectOnce(error: unknown) {
+      stop();
+      reject(error);
+    }
+
+    function requestCreate() {
+      if (finished) return;
+
+      pendingCreate = true;
+      maybeCreate();
+    }
+
+    function maybeCreate() {
+      if (
+        finished ||
+        isCreating ||
+        !pendingCreate ||
+        shouldWaitForVisibility()
+      ) {
+        return;
+      }
+
+      pendingCreate = false;
+      void create();
+    }
 
     // In browser environments, close the connection when the page is hidden
     // and reopen it when the page becomes visible again — unless the caller
@@ -61,25 +134,24 @@ export function fetchEventSource(
     const disposeVisibility = openWhenHidden
       ? () => {}
       : setupVisibility(
-          () => curRequestController.abort(),
-          () => create(),
-        )
+          () => {
+            clearRetryTimer();
+            abortCurrentRequest();
+          },
+          () => {
+            clearRetryTimer();
+            requestCreate();
+          },
+        );
 
-    /** Release all held resources: visibility listener, retry timer, request. */
-    function dispose() {
-      disposeVisibility()
-      clearTimeout(retryTimer)
-      curRequestController.abort()
-    }
+    const removeAbortListeners = externalSignals.map((signal) => {
+      const onAbort = () => resolveOnce();
+      signal.addEventListener("abort", onAbort, { once: true });
+      return () => signal.removeEventListener("abort", onAbort);
+    });
 
-    // If the caller-provided signal fires, tear everything down silently.
-    inputSignal?.addEventListener('abort', () => {
-      dispose()
-      resolve()
-    }, { once: true })
-
-    const fetch = inputFetch ?? globalThis.fetch
-    const onopen = inputOnOpen ?? defaultOnOpen
+    const fetch = inputFetch ?? globalThis.fetch;
+    const onopen = inputOnOpen ?? defaultOnOpen;
 
     /**
      * Core connection loop. Each invocation represents a single
@@ -87,23 +159,26 @@ export function fetchEventSource(
      * schedules itself to run again after `retryInterval` ms.
      */
     async function create() {
+      if (finished) return;
+
       // Capture a local reference so the catch block checks the correct
       // controller even if a new create() call overwrites curRequestController
       // (e.g. rapid visibility toggles).
-      const controller = new AbortController()
-      curRequestController = controller
-      receiveState = ReceiveState.IDLE
+      const controller = new AbortController();
+      isCreating = true;
+      curRequestController = controller;
+      receiveState = ReceiveState.IDLE;
       try {
         const response = await fetch(input, {
           ...rest,
           headers,
           signal: controller.signal,
-        })
+        });
 
-        await onopen(response)
+        await onopen(response);
 
         if (!response.body) {
-          throw new Error('Response body is null')
+          throw new Error("Response body is null");
         }
 
         // Build the streaming pipeline:
@@ -113,66 +188,73 @@ export function fetchEventSource(
           .pipeThrough(
             new EventSourceParserStream({
               onRetry(ms) {
-                retryInterval = ms
+                retryInterval = ms;
               },
             }),
-          )
+          );
 
         // Consume messages one by one.
-        const reader = eventStream.getReader()
+        const reader = eventStream.getReader();
         try {
           for (;;) {
-            const { done, value: event } = await reader.read()
-            if (done) break
+            const { done, value: event } = await reader.read();
+            if (done) break;
 
             // Track the last event id so it can be sent back on reconnection,
             // allowing the server to resume from where it left off.
             if (event.id !== undefined) {
               if (event.id) {
-                headers[LastEventId] = event.id
-                receiveState = ReceiveState.RECEIVED
+                headers[LastEventId] = event.id;
+                receiveState = ReceiveState.RECEIVED;
               } else {
-                delete headers[LastEventId]
-                receiveState = ReceiveState.RECEIVED_NO_ID
+                delete headers[LastEventId];
+                receiveState = ReceiveState.RECEIVED_NO_ID;
               }
             } else {
               // Message without id field at all
               if (receiveState === ReceiveState.IDLE) {
-                receiveState = ReceiveState.RECEIVED_NO_ID
+                receiveState = ReceiveState.RECEIVED_NO_ID;
               }
             }
 
-            onmessage?.(event)
+            onmessage?.(event);
           }
         } finally {
-          reader.releaseLock()
+          reader.releaseLock();
         }
 
         // Stream ended cleanly — notify the caller and resolve.
-        onclose?.(receiveState)
-        dispose()
-        resolve()
+        onclose?.(receiveState);
+        resolveOnce();
       } catch (err) {
         // If we aborted the request ourselves (visibility change, caller
         // signal, etc.) there is nothing to retry — just bail out.
-        if (!controller.signal.aborted) {
+        if (!finished && !controller.signal.aborted) {
           try {
             // Let the caller decide the retry interval. Returning a number
             // overrides the default; returning nothing keeps it; throwing
             // aborts the whole operation.
-            const interval = onerror?.(err, receiveState) ?? retryInterval
-            clearTimeout(retryTimer)
-            retryTimer = setTimeout(create, interval)
+            const interval = onerror?.(err, receiveState) ?? retryInterval;
+            clearRetryTimer();
+            retryTimer = setTimeout(() => {
+              retryTimer = undefined;
+              requestCreate();
+            }, interval);
           } catch (innerErr) {
-            dispose()
-            reject(innerErr)
+            rejectOnce(innerErr);
           }
         }
+      } finally {
+        if (curRequestController === controller) {
+          curRequestController = undefined;
+        }
+        isCreating = false;
+        maybeCreate();
       }
     }
 
-    create()
-  })
+    requestCreate();
+  });
 }
 
 /**
@@ -180,10 +262,18 @@ export function fetchEventSource(
  * event stream rather than, say, an HTML error page.
  */
 function defaultOnOpen(response: Response) {
-  const contentType = response.headers.get('content-type')
+  const contentType = response.headers.get("content-type");
   if (!contentType?.startsWith(EventStreamContentType)) {
     throw new Error(
       `Expected content-type to be ${EventStreamContentType}, Actual: ${contentType}`,
-    )
+    );
   }
+}
+
+function copyHeaders(target: Record<string, string>, source?: HeadersInit) {
+  if (!source) return;
+
+  new Headers(source).forEach((value, key) => {
+    target[key.toLowerCase()] = value;
+  });
 }

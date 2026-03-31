@@ -1,6 +1,6 @@
-import type { EventSourceMessage } from 'eventsource-parser'
+import type { EventSourceMessage } from "eventsource-parser";
 
-export type { EventSourceMessage }
+export type { EventSourceMessage };
 
 /**
  * Describes the data receive state of the SSE stream at close time.
@@ -12,9 +12,9 @@ export type { EventSourceMessage }
  *                        by the server sending an empty `id:` field).
  */
 export enum ReceiveState {
-  IDLE = 'IDLE',
-  RECEIVED = 'RECEIVED',
-  RECEIVED_NO_ID = 'RECEIVED_NO_ID',
+  IDLE = "IDLE",
+  RECEIVED = "RECEIVED",
+  RECEIVED_NO_ID = "RECEIVED_NO_ID",
 }
 
 /**
@@ -24,18 +24,18 @@ export enum ReceiveState {
  * Headers are narrowed to `Record<string, string>` so the library can
  * transparently append the `last-event-id` header on reconnection.
  */
-export interface FetchEventSourceInit extends Omit<RequestInit, 'headers'> {
+export interface FetchEventSourceInit extends Omit<RequestInit, "headers"> {
   /**
    * Request headers. Only the `Record<string, string>` form is accepted
    * because the library may append `last-event-id` for automatic resumption.
    */
-  headers?: Record<string, string>
+  headers?: Record<string, string>;
 
   /**
    * A custom `fetch` implementation. Defaults to `globalThis.fetch`.
    * Useful for injecting polyfills or test doubles.
    */
-  fetch?: typeof globalThis.fetch
+  fetch?: typeof globalThis.fetch;
 
   /**
    * Called once the response is received, before the body is consumed.
@@ -43,14 +43,14 @@ export interface FetchEventSourceInit extends Omit<RequestInit, 'headers'> {
    * throw if it does not match expectations. If omitted, a default
    * validator asserts that the content-type is `text/event-stream`.
    */
-  onopen?: (response: Response) => void | Promise<void>
+  onopen?: (response: Response) => void | Promise<void>;
 
   /**
    * Called for every SSE message, regardless of its `event` type.
    * This differs from the native `EventSource.onmessage`, which only
    * fires for events without a custom type.
    */
-  onmessage?: (ev: EventSourceMessage) => void
+  onmessage?: (ev: EventSourceMessage) => void;
 
   /**
    * Called when the response stream closes gracefully. If you do not
@@ -59,7 +59,7 @@ export interface FetchEventSourceInit extends Omit<RequestInit, 'headers'> {
    *
    * The parameter is the final {@link StreamStatus} at the time of close.
    */
-  onclose?: (receiveState: ReceiveState) => void
+  onclose?: (receiveState: ReceiveState) => void;
 
   /**
    * Called on any error — network failures, non-2xx responses, stream
@@ -75,7 +75,7 @@ export interface FetchEventSourceInit extends Omit<RequestInit, 'headers'> {
    *
    * The second parameter is the current {@link ReceiveState}.
    */
-  onerror?: (err: any, receiveState: ReceiveState) => number | undefined | void
+  onerror?: (err: any, receiveState: ReceiveState) => number | undefined | void;
 
   /**
    * By default the connection is closed when the page becomes hidden
@@ -83,5 +83,5 @@ export interface FetchEventSourceInit extends Omit<RequestInit, 'headers'> {
    * Set this to `true` to keep the connection alive regardless of
    * visibility state. Has no effect in non-browser environments.
    */
-  openWhenHidden?: boolean
+  openWhenHidden?: boolean;
 }

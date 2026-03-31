@@ -1,6 +1,6 @@
 {
   "name": "modern-fetch-stream",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Modern, robust Server-Sent Events client built on fetch API and eventsource-parser",
   "type": "module",
   "exports": {
@@ -23,6 +23,8 @@
     "build": "tsup",
     "check": "tsc --noEmit",
     "test": "vitest run",
+    "test:e2e": "npm --prefix test-server test",
+    "test:all": "npm test && npm run test:e2e",
     "test:watch": "vitest"
   },
   "dependencies": {

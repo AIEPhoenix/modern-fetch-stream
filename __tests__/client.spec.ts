@@ -27,6 +27,53 @@ function mockSSEResponse(
   return new Response(body, { status, headers: { 'content-type': contentType } })
 }
 
+function installMockDocument(initialHidden = false) {
+  const originalDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'document')
+  const listeners = new Set<() => void>()
+  const mockDocument = {
+    hidden: initialHidden,
+    addEventListener(type: string, listener: EventListenerOrEventListenerObject) {
+      if (type !== 'visibilitychange') return
+      listeners.add(toListener(listener))
+    },
+    removeEventListener(type: string, listener: EventListenerOrEventListenerObject) {
+      if (type !== 'visibilitychange') return
+      listeners.delete(toListener(listener))
+    },
+  } as Pick<Document, 'hidden' | 'addEventListener' | 'removeEventListener'>
+
+  Object.defineProperty(globalThis, 'document', {
+    configurable: true,
+    value: mockDocument,
+  })
+
+  return {
+    setHidden(hidden: boolean) {
+      mockDocument.hidden = hidden
+    },
+    dispatchVisibilityChange() {
+      for (const listener of [...listeners]) {
+        listener()
+      }
+    },
+    restore() {
+      if (originalDescriptor) {
+        Object.defineProperty(globalThis, 'document', originalDescriptor)
+      } else {
+        delete (globalThis as { document?: Document }).document
+      }
+    },
+  }
+}
+
+function toListener(listener: EventListenerOrEventListenerObject) {
+  if (typeof listener === 'function') {
+    return listener as () => void
+  }
+
+  return () => listener.handleEvent(new Event('visibilitychange'))
+}
+
 describe('fetchEventSource', () => {
   beforeEach(() => vi.restoreAllMocks())
 
@@ -70,6 +117,22 @@ describe('fetchEventSource', () => {
     })
 
     expect(mockFetch.mock.calls[0][1].method).toBe('POST')
+    expect(mockFetch.mock.calls[0][1].headers.authorization).toBe('Bearer x')
+    expect(mockFetch.mock.calls[0][1].headers.accept).toBe(EventStreamContentType)
+  })
+
+  it('should preserve headers from Request input', async () => {
+    const mockFetch = vi.fn().mockResolvedValue(
+      mockSSEResponse([sseChunk('data: ok')]),
+    )
+    const request = new Request('http://test/sse', {
+      headers: { Authorization: 'Bearer x' },
+    })
+
+    await fetchEventSource(request, {
+      fetch: mockFetch,
+    })
+
     expect(mockFetch.mock.calls[0][1].headers.authorization).toBe('Bearer x')
     expect(mockFetch.mock.calls[0][1].headers.accept).toBe(EventStreamContentType)
   })
@@ -393,7 +456,72 @@ describe('fetchEventSource', () => {
       signal: ctrl.signal,
     })
 
-    expect(mockFetch.mock.calls.length).toBeLessThanOrEqual(1)
+    expect(mockFetch).not.toHaveBeenCalled()
+  })
+
+  // ── visibility ──────────────────────────────────
+
+  it('should wait until visible before connecting when page starts hidden', async () => {
+    const mockDocument = installMockDocument(true)
+    const mockFetch = vi.fn().mockResolvedValue(
+      mockSSEResponse([sseChunk('data: ok')]),
+    )
+
+    try {
+      const promise = fetchEventSource('http://test/sse', {
+        fetch: mockFetch,
+      })
+
+      await Promise.resolve()
+      expect(mockFetch).not.toHaveBeenCalled()
+
+      mockDocument.setHidden(false)
+      mockDocument.dispatchVisibilityChange()
+      await promise
+
+      expect(mockFetch).toHaveBeenCalledOnce()
+    } finally {
+      mockDocument.restore()
+    }
+  })
+
+  it('should clear pending retry before reconnecting on visibility restore', async () => {
+    vi.useFakeTimers()
+    const mockDocument = installMockDocument()
+    let callCount = 0
+    const mockFetch = vi.fn().mockImplementation(() => {
+      callCount++
+      if (callCount === 1) {
+        return Promise.reject(new Error('fail'))
+      }
+      return Promise.resolve(mockSSEResponse([sseChunk('data: ok')]))
+    })
+
+    try {
+      const promise = fetchEventSource('http://test/sse', {
+        fetch: mockFetch,
+        onmessage() {},
+      })
+
+      await vi.advanceTimersByTimeAsync(0)
+      expect(callCount).toBe(1)
+
+      mockDocument.setHidden(true)
+      mockDocument.dispatchVisibilityChange()
+      mockDocument.setHidden(false)
+      mockDocument.dispatchVisibilityChange()
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(callCount).toBe(2)
+
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(callCount).toBe(2)
+
+      await promise
+    } finally {
+      mockDocument.restore()
+      vi.useRealTimers()
+    }
   })
 
   // ── onclose throw triggers retry ────────────────
