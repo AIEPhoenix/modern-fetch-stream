@@ -9,6 +9,7 @@
 import { randomUUID } from 'node:crypto'
 import {
   EventStreamContentType,
+  FetchEventSourceCloseReason,
   FetchEventSourceDecision,
   ResponseError,
   RetriableError,
@@ -141,16 +142,21 @@ async function main() {
     await test('aborts cleanly via AbortController', async () => {
       const controller = new AbortController()
       const messages: string[] = []
+      let closeReason: string | undefined
 
       setTimeout(() => controller.abort(), 280)
 
       await fetchEventSource(`${baseUrl}/slow`, {
         signal: controller.signal,
+        onClose(close) {
+          closeReason = close.reason
+        },
         onMessage(event) {
           messages.push(event.data)
         },
       })
 
+      assert(closeReason === FetchEventSourceCloseReason.Aborted, `unexpected close reason: ${closeReason}`)
       assert(messages.length > 0, 'expected to receive some messages before abort')
       assert(messages.length < 5, `expected fewer than 5 messages, got ${messages.length}`)
     })
@@ -226,13 +232,16 @@ async function main() {
 
     await test('calls onClose with ReceiveState on normal end', async () => {
       let finalState: ReceiveState | undefined
+      let closeReason: string | undefined
 
       await fetchEventSource(`${baseUrl}/with-id`, {
-        onClose(state) {
-          finalState = state
+        onClose(close) {
+          finalState = close.receiveState
+          closeReason = close.reason
         },
       })
 
+      assert(closeReason === FetchEventSourceCloseReason.Eof, `unexpected close reason: ${closeReason}`)
       assert(finalState === ReceiveState.RECEIVED, `unexpected receive state: ${finalState}`)
     })
 
@@ -248,9 +257,10 @@ async function main() {
         onMessage(event) {
           messages.push(event.data)
         },
-        onClose(state) {
+        onClose(close) {
           if (attempts < 2) {
-            assert(state === ReceiveState.RECEIVED, `unexpected receive state during reconnect: ${state}`)
+            assert(close.reason === FetchEventSourceCloseReason.Eof, `unexpected close reason during reconnect: ${close.reason}`)
+            assert(close.receiveState === ReceiveState.RECEIVED, `unexpected receive state during reconnect: ${close.receiveState}`)
             throw new RetriableError('retry to resume stream', 50)
           }
         },
@@ -272,9 +282,10 @@ async function main() {
         onMessage(event) {
           messages.push(event.data)
         },
-        onClose(state) {
+        onClose(close) {
           if (openTimes.length < 2) {
-            assert(state === ReceiveState.RECEIVED, `unexpected receive state during hinted reconnect: ${state}`)
+            assert(close.reason === FetchEventSourceCloseReason.Eof, `unexpected close reason during hinted reconnect: ${close.reason}`)
+            assert(close.receiveState === ReceiveState.RECEIVED, `unexpected receive state during hinted reconnect: ${close.receiveState}`)
             throw new RetriableError('retry using server hint')
           }
         },

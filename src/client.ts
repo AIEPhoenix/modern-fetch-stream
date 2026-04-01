@@ -7,10 +7,15 @@ import {
 } from "./errors";
 import type {
   ErrorDecision,
+  FetchEventSourceClose,
   FetchEventSourceInit,
   ResponseDecision,
 } from "./types";
-import { FetchEventSourceDecision, ReceiveState } from "./types";
+import {
+  FetchEventSourceCloseReason,
+  FetchEventSourceDecision,
+  ReceiveState,
+} from "./types";
 import { setupVisibility } from "./visibility";
 
 const DefaultRetryInterval = 1000;
@@ -67,16 +72,12 @@ export function fetchEventSource(
     let isCreating = false;
     let pendingCreate = false;
     let finished = false;
+    let closeCalled = false;
 
     const externalSignals = [
       input instanceof Request ? input.signal : undefined,
       inputSignal,
     ].filter((signal): signal is AbortSignal => signal !== undefined);
-
-    if (externalSignals.some((signal) => signal.aborted)) {
-      resolve();
-      return;
-    }
 
     function clearRetryTimer() {
       if (retryTimer !== undefined) {
@@ -112,6 +113,19 @@ export function fetchEventSource(
     function resolveOnce() {
       stop();
       resolve();
+    }
+
+    async function resolveClosed(close: FetchEventSourceClose) {
+      if (finished || closeCalled) return;
+      closeCalled = true;
+      stop();
+
+      try {
+        await onClose?.(close);
+        resolve();
+      } catch (error) {
+        reject(error);
+      }
     }
 
     function rejectOnce(error: unknown) {
@@ -162,10 +176,23 @@ export function fetchEventSource(
         );
 
     const removeAbortListeners = externalSignals.map((signal) => {
-      const abort = () => resolveOnce();
+      const abort = () => {
+        void resolveClosed({
+          reason: FetchEventSourceCloseReason.Aborted,
+          receiveState,
+        });
+      };
       signal.addEventListener("abort", abort, { once: true });
       return () => signal.removeEventListener("abort", abort);
     });
+
+    if (externalSignals.some((signal) => signal.aborted)) {
+      void resolveClosed({
+        reason: FetchEventSourceCloseReason.Aborted,
+        receiveState,
+      });
+      return;
+    }
 
     const fetch = inputFetch ?? globalThis.fetch;
     const classifyResponse = inputClassifyResponse ?? defaultClassifyResponse;
@@ -218,6 +245,7 @@ export function fetchEventSource(
       isCreating = true;
       curRequestController = controller;
       receiveState = ReceiveState.IDLE;
+      closeCalled = false;
 
       try {
         const response = await fetch(input, {
@@ -274,7 +302,18 @@ export function fetchEventSource(
           reader.releaseLock();
         }
 
-        await onClose?.(receiveState);
+        if (finished || controller.signal.aborted || closeCalled) {
+          return;
+        }
+        closeCalled = true;
+
+        // Not using resolveClosed here: thrown/rejected values from an
+        // eof close must route through classifyError (retriable), whereas
+        // resolveClosed rejects the promise directly (abort semantics).
+        await onClose?.({
+          reason: FetchEventSourceCloseReason.Eof,
+          receiveState,
+        });
         resolveOnce();
       } catch (error) {
         if (!finished && !controller.signal.aborted) {

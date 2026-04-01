@@ -23,8 +23,21 @@ export const FetchEventSourceDecision = {
   Fatal: "fatal",
 } as const;
 
+export const FetchEventSourceCloseReason = {
+  Eof: "eof",
+  Aborted: "aborted",
+} as const;
+
 export type FetchEventSourceDecisionValue =
   (typeof FetchEventSourceDecision)[keyof typeof FetchEventSourceDecision];
+
+export type FetchEventSourceCloseReasonValue =
+  (typeof FetchEventSourceCloseReason)[keyof typeof FetchEventSourceCloseReason];
+
+export interface FetchEventSourceClose {
+  reason: FetchEventSourceCloseReasonValue;
+  receiveState: ReceiveState;
+}
 
 export type ErrorDecision =
   | Exclude<
@@ -93,12 +106,16 @@ export interface FetchEventSourceInit extends Omit<RequestInit, "headers"> {
   onMessage?: (ev: EventSourceMessage) => void | Promise<void>;
 
   /**
-   * Called when the response stream closes gracefully. Throw inside this
-   * callback if you want the close to be routed through `classifyError`.
+   * Called when the SSE request closes.
    *
-   * The parameter is the final {@link ReceiveState} at the time of close.
+   * For `reason: "eof"`, thrown or rejected values are routed through
+   * `classifyError`. For `reason: "aborted"`, thrown or rejected values
+   * reject the returned promise directly.
+   *
+   * The callback receives the close reason and the final
+   * {@link ReceiveState} at the time of close.
    */
-  onClose?: (receiveState: ReceiveState) => void | Promise<void>;
+  onClose?: (close: FetchEventSourceClose) => void | Promise<void>;
 
   /**
    * Decide whether an error should be retried or treated as fatal.

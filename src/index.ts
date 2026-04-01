@@ -6,10 +6,16 @@ export {
   ResponseError,
   RetriableError,
 } from "./errors";
-export { FetchEventSourceDecision, ReceiveState } from "./types";
+export {
+  FetchEventSourceCloseReason,
+  FetchEventSourceDecision,
+  ReceiveState,
+} from "./types";
 export type {
   ErrorDecision,
   EventSourceMessage,
+  FetchEventSourceClose,
+  FetchEventSourceCloseReasonValue,
   FetchEventSourceInit,
   FetchEventSourceDecisionValue,
   ResponseDecision,

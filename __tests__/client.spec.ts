@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   EventStreamContentType,
+  FetchEventSourceCloseReason,
   FatalError,
   FetchEventSourceDecision,
   ResponseError,
@@ -190,11 +191,15 @@ describe("fetchEventSource", () => {
 
     await fetchEventSource("http://test/sse", { fetch: mockFetch, onClose });
 
-    expect(onClose).toHaveBeenCalledOnce();
+    expect(onClose).toHaveBeenCalledWith({
+      reason: FetchEventSourceCloseReason.Eof,
+      receiveState: ReceiveState.RECEIVED_NO_ID,
+    });
   });
 
   it("resolves on abort", async () => {
     const controller = new AbortController();
+    const onClose = vi.fn();
     const mockFetch = vi
       .fn()
       .mockResolvedValue(mockSSEResponse([sseChunk("data: 1")], { delay: 50 }));
@@ -204,7 +209,82 @@ describe("fetchEventSource", () => {
     await fetchEventSource("http://test/sse", {
       fetch: mockFetch,
       signal: controller.signal,
+      onClose,
     });
+
+    expect(onClose).toHaveBeenCalledWith({
+      reason: FetchEventSourceCloseReason.Aborted,
+      receiveState: ReceiveState.IDLE,
+    });
+    expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it("does not emit eof after an aborted close", async () => {
+    const controller = new AbortController();
+    const onClose = vi.fn();
+    const mockFetch = vi.fn().mockImplementation(
+      (_input: string, init?: RequestInit) => {
+        let streamController:
+          | ReadableStreamDefaultController<Uint8Array>
+          | undefined;
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            streamController = controller;
+            controller.enqueue(new TextEncoder().encode(sseChunk("data: 1")));
+            init?.signal?.addEventListener(
+              "abort",
+              () => {
+                streamController?.close();
+              },
+              { once: true },
+            );
+          },
+        });
+
+        return Promise.resolve(
+          new Response(body, {
+            status: 200,
+            headers: { "content-type": EventStreamContentType },
+          }),
+        );
+      },
+    );
+
+    const promise = fetchEventSource("http://test/sse", {
+      fetch: mockFetch,
+      signal: controller.signal,
+      onClose,
+      async onMessage() {
+        controller.abort();
+      },
+    });
+
+    await promise;
+
+    expect(onClose).toHaveBeenCalledOnce();
+    expect(onClose).toHaveBeenCalledWith({
+      reason: FetchEventSourceCloseReason.Aborted,
+      receiveState: ReceiveState.RECEIVED_NO_ID,
+    });
+  });
+
+  it("rejects when onClose throws on abort", async () => {
+    const controller = new AbortController();
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValue(mockSSEResponse([sseChunk("data: 1")], { delay: 50 }));
+
+    setTimeout(() => controller.abort(), 10);
+
+    await expect(
+      fetchEventSource("http://test/sse", {
+        fetch: mockFetch,
+        signal: controller.signal,
+        onClose() {
+          throw new Error("abort handler error");
+        },
+      }),
+    ).rejects.toThrow("abort handler error");
   });
 
   it("retries on generic errors with the default interval", async () => {
@@ -557,7 +637,10 @@ describe("fetchEventSource", () => {
 
     await fetchEventSource("http://test/sse", { fetch: mockFetch, onClose });
 
-    expect(onClose).toHaveBeenCalledWith(ReceiveState.RECEIVED);
+    expect(onClose).toHaveBeenCalledWith({
+      reason: FetchEventSourceCloseReason.Eof,
+      receiveState: ReceiveState.RECEIVED,
+    });
   });
 
   it("passes RECEIVED_NO_ID to onClose when messages have no id", async () => {
@@ -568,7 +651,10 @@ describe("fetchEventSource", () => {
 
     await fetchEventSource("http://test/sse", { fetch: mockFetch, onClose });
 
-    expect(onClose).toHaveBeenCalledWith(ReceiveState.RECEIVED_NO_ID);
+    expect(onClose).toHaveBeenCalledWith({
+      reason: FetchEventSourceCloseReason.Eof,
+      receiveState: ReceiveState.RECEIVED_NO_ID,
+    });
   });
 
   it("passes IDLE to onClose when no messages were received", async () => {
@@ -577,7 +663,10 @@ describe("fetchEventSource", () => {
 
     await fetchEventSource("http://test/sse", { fetch: mockFetch, onClose });
 
-    expect(onClose).toHaveBeenCalledWith(ReceiveState.IDLE);
+    expect(onClose).toHaveBeenCalledWith({
+      reason: FetchEventSourceCloseReason.Eof,
+      receiveState: ReceiveState.IDLE,
+    });
   });
 
   it("retries immediately when classifyError returns retryAfter 0", async () => {
@@ -670,6 +759,7 @@ describe("fetchEventSource", () => {
   it("resolves immediately with a pre-aborted signal", async () => {
     const controller = new AbortController();
     controller.abort();
+    const onClose = vi.fn();
 
     const mockFetch = vi.fn().mockImplementation(
       (_input: string, init: RequestInit) => {
@@ -684,9 +774,55 @@ describe("fetchEventSource", () => {
     await fetchEventSource("http://test/sse", {
       fetch: mockFetch,
       signal: controller.signal,
+      onClose,
     });
 
     expect(mockFetch).not.toHaveBeenCalled();
+    expect(onClose).toHaveBeenCalledWith({
+      reason: FetchEventSourceCloseReason.Aborted,
+      receiveState: ReceiveState.IDLE,
+    });
+  });
+
+  it("does not report visibility-based pause and resume as aborted close", async () => {
+    vi.useFakeTimers();
+    const mockDocument = installMockDocument();
+    const onClose = vi.fn();
+    let callCount = 0;
+    const mockFetch = vi.fn().mockImplementation(() => {
+      callCount++;
+      if (callCount === 1) {
+        return Promise.reject(new Error("fail"));
+      }
+      return Promise.resolve(mockSSEResponse([sseChunk("data: ok")]));
+    });
+
+    try {
+      const promise = fetchEventSource("http://test/sse", {
+        fetch: mockFetch,
+        onClose,
+        onMessage() {},
+      });
+
+      await vi.advanceTimersByTimeAsync(0);
+      expect(callCount).toBe(1);
+
+      mockDocument.setHidden(true);
+      mockDocument.dispatchVisibilityChange();
+      mockDocument.setHidden(false);
+      mockDocument.dispatchVisibilityChange();
+      await vi.advanceTimersByTimeAsync(0);
+      await promise;
+
+      expect(onClose).toHaveBeenCalledTimes(1);
+      expect(onClose).toHaveBeenCalledWith({
+        reason: FetchEventSourceCloseReason.Eof,
+        receiveState: ReceiveState.RECEIVED_NO_ID,
+      });
+    } finally {
+      mockDocument.restore();
+      vi.useRealTimers();
+    }
   });
 
   it("waits until visible before connecting when the page starts hidden", async () => {
@@ -824,5 +960,7 @@ describe("fetchEventSource", () => {
     expect(FetchEventSourceDecision.Accept).toBe("accept");
     expect(FetchEventSourceDecision.Retry).toBe("retry");
     expect(FetchEventSourceDecision.Fatal).toBe("fatal");
+    expect(FetchEventSourceCloseReason.Eof).toBe("eof");
+    expect(FetchEventSourceCloseReason.Aborted).toBe("aborted");
   });
 });
