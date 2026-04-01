@@ -17,6 +17,26 @@ export enum ReceiveState {
   RECEIVED_NO_ID = "RECEIVED_NO_ID",
 }
 
+export const FetchEventSourceDecision = {
+  Accept: "accept",
+  Retry: "retry",
+  Fatal: "fatal",
+} as const;
+
+export type FetchEventSourceDecisionValue =
+  (typeof FetchEventSourceDecision)[keyof typeof FetchEventSourceDecision];
+
+export type ErrorDecision =
+  | Exclude<
+      FetchEventSourceDecisionValue,
+      typeof FetchEventSourceDecision.Accept
+    >
+  | { retryAfter: number };
+
+export type ResponseDecision =
+  | FetchEventSourceDecisionValue
+  | { retryAfter: number };
+
 /**
  * Options for {@link fetchEventSource}. Extends the standard `RequestInit`
  * with SSE-specific lifecycle callbacks and retry control.
@@ -38,50 +58,57 @@ export interface FetchEventSourceInit extends Omit<RequestInit, "headers"> {
   fetch?: typeof globalThis.fetch;
 
   /**
-   * Called once the response is received, before the body is consumed.
-   * Use this to validate the response (status code, headers, etc.) and
-   * throw if it does not match expectations. If omitted, a default
-   * validator asserts that the content-type is `text/event-stream`.
-   */
-  onopen?: (response: Response) => void | Promise<void>;
-
-  /**
-   * Called for every SSE message, regardless of its `event` type.
-   * This differs from the native `EventSource.onmessage`, which only
-   * fires for events without a custom type.
-   */
-  onmessage?: (ev: EventSourceMessage) => void;
-
-  /**
-   * Called when the response stream closes gracefully. If you do not
-   * expect the server to end the connection, throw inside this callback
-   * to trigger a retry via `onerror`.
-   *
-   * The parameter is the final {@link StreamStatus} at the time of close.
-   */
-  onclose?: (receiveState: ReceiveState) => void;
-
-  /**
-   * Called on any error — network failures, non-2xx responses, stream
-   * interruptions, or exceptions thrown by other callbacks. Controls
-   * the retry strategy:
-   *
-   * - **Return a number** — retry after that many milliseconds.
-   * - **Return nothing** — retry after the current `retryInterval` (1 s by default,
-   *   overridable by the server via the SSE `retry` field).
-   * - **Rethrow / throw** — abort permanently; the returned promise rejects.
-   *
-   * When this callback is omitted, every error is treated as retriable.
-   *
-   * The second parameter is the current {@link ReceiveState}.
-   */
-  onerror?: (err: any, receiveState: ReceiveState) => number | undefined | void;
-
-  /**
    * By default the connection is closed when the page becomes hidden
    * and re-established when it becomes visible again (browser only).
    * Set this to `true` to keep the connection alive regardless of
    * visibility state. Has no effect in non-browser environments.
    */
   openWhenHidden?: boolean;
+
+  /**
+   * Decide whether a freshly received response should be accepted,
+   * retried, or treated as fatal before the body is consumed.
+   *
+   * If omitted, the library accepts only `2xx` `text/event-stream`
+   * responses and rejects every other response as fatal.
+   */
+  classifyResponse?: (
+    response: Response,
+  ) => ResponseDecision | Promise<ResponseDecision>;
+
+  /**
+   * Called after `classifyResponse` accepts the response, right before
+   * the response body starts streaming.
+   */
+  onOpen?: (response: Response) => void | Promise<void>;
+
+  /**
+   * Called for every SSE message, regardless of its `event` type.
+   * This differs from the native `EventSource.onmessage`, which only
+   * fires for events without a custom type.
+   *
+   * Async handlers are awaited serially, so message processing preserves
+   * stream order and rejected promises are routed through `classifyError`.
+   */
+  onMessage?: (ev: EventSourceMessage) => void | Promise<void>;
+
+  /**
+   * Called when the response stream closes gracefully. Throw inside this
+   * callback if you want the close to be routed through `classifyError`.
+   *
+   * The parameter is the final {@link ReceiveState} at the time of close.
+   */
+  onClose?: (receiveState: ReceiveState) => void | Promise<void>;
+
+  /**
+   * Decide whether an error should be retried or treated as fatal.
+   *
+   * If omitted, the library retries ordinary errors, treats
+   * `RetriableError` as retriable, and treats `FatalError` /
+   * `ResponseError` as fatal.
+   */
+  classifyError?: (
+    err: unknown,
+    receiveState: ReceiveState,
+  ) => ErrorDecision | Promise<ErrorDecision>;
 }

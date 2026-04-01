@@ -7,7 +7,14 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { fetchEventSource, EventStreamContentType, ReceiveState } from '../src/index'
+import {
+  EventStreamContentType,
+  FetchEventSourceDecision,
+  ResponseError,
+  RetriableError,
+  ReceiveState,
+  fetchEventSource,
+} from '../src/index'
 import { resetTestState, startTestServer, stopTestServer } from './server'
 
 const externalBase = process.env.BASE_URL
@@ -43,9 +50,9 @@ async function readJsonEvent<T>(
 
   await fetchEventSource(input, {
     ...init,
-    onmessage(event) {
+    async onMessage(event) {
       payload = JSON.parse(event.data) as T
-      init?.onmessage?.(event)
+      await init?.onMessage?.(event)
     },
   })
 
@@ -64,7 +71,7 @@ async function main() {
     await test('receives basic messages', async () => {
       const messages: string[] = []
       await fetchEventSource(`${baseUrl}/basic`, {
-        onmessage(event) {
+        onMessage(event) {
           messages.push(event.data)
         },
       })
@@ -78,7 +85,7 @@ async function main() {
       const events: Array<{ type?: string; data: string }> = []
 
       await fetchEventSource(`${baseUrl}/typed-events`, {
-        onmessage(event) {
+        onMessage(event) {
           events.push({ type: event.event, data: event.data })
         },
       })
@@ -93,7 +100,7 @@ async function main() {
       const ids: string[] = []
 
       await fetchEventSource(`${baseUrl}/with-id?start=10&count=4`, {
-        onmessage(event) {
+        onMessage(event) {
           if (event.id) ids.push(event.id)
         },
       })
@@ -105,7 +112,7 @@ async function main() {
       const messages: string[] = []
 
       await fetchEventSource(`${baseUrl}/multiline`, {
-        onmessage(event) {
+        onMessage(event) {
           messages.push(event.data)
         },
       })
@@ -121,7 +128,7 @@ async function main() {
       const messages: string[] = []
 
       await fetchEventSource(`${baseUrl}/large`, {
-        onmessage(event) {
+        onMessage(event) {
           messages.push(event.data)
         },
       })
@@ -139,7 +146,7 @@ async function main() {
 
       await fetchEventSource(`${baseUrl}/slow`, {
         signal: controller.signal,
-        onmessage(event) {
+        onMessage(event) {
           messages.push(event.data)
         },
       })
@@ -169,7 +176,7 @@ async function main() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ hello: 'world' }),
-        onmessage(event) {
+        onMessage(event) {
           messages.push(event.data)
         },
       })
@@ -179,63 +186,49 @@ async function main() {
       assert(parsed.hello === 'world', 'body echo mismatch')
     })
 
-    await test('supports custom onopen validation', async () => {
+    await test('calls onOpen after the response is accepted', async () => {
       let openCalled = false
 
       await fetchEventSource(`${baseUrl}/basic`, {
-        onopen(response) {
+        onOpen(response) {
           openCalled = true
-          if (!response.ok) throw new Error('unexpected response')
+          assert(response.ok, 'unexpected response')
         },
       })
 
-      assert(openCalled, 'onopen was not called')
+      assert(openCalled, 'onOpen was not called')
     })
 
-    await test('rejects wrong content-type', async () => {
-      let thrown = false
-
-      try {
-        await fetchEventSource(`${baseUrl}/wrong-content-type`, {
-          onerror() {
-            throw new Error('wrong content-type')
-          },
-        })
-      } catch (error) {
-        thrown = true
-        assert(error instanceof Error && error.message === 'wrong content-type', 'unexpected error')
-      }
-
-      assert(thrown, 'expected wrong content-type to throw')
+    await test('rejects wrong content-type with ResponseError', async () => {
+      await assertRejects(
+        fetchEventSource(`${baseUrl}/wrong-content-type`),
+        (error) => {
+          assert(error instanceof ResponseError, 'expected ResponseError')
+        },
+      )
     })
 
-    await test('rejects 401 when onerror marks it fatal', async () => {
-      let thrown = false
-
-      try {
-        await fetchEventSource(`${baseUrl}/error-401`, {
-          onopen(response) {
-            if (!response.ok) {
-              throw new Error(`http ${response.status}`)
-            }
+    await test('classifyResponse can mark 401 as fatal', async () => {
+      await assertRejects(
+        fetchEventSource(`${baseUrl}/error-401`, {
+          classifyResponse(response) {
+            return response.ok
+              ? FetchEventSourceDecision.Accept
+              : FetchEventSourceDecision.Fatal
           },
-          onerror() {
-            throw new Error('unauthorized')
-          },
-        })
-      } catch (error) {
-        thrown = true
-        assert(error instanceof Error && error.message === 'unauthorized', 'unexpected 401 error')
-      }
-
-      assert(thrown, 'expected 401 path to throw')
+        }),
+        (error) => {
+          assert(error instanceof ResponseError, 'expected ResponseError for 401')
+          assert(error.response.status === 401, `unexpected status: ${error.response.status}`)
+        },
+      )
     })
 
-    await test('calls onclose with ReceiveState on normal end', async () => {
+    await test('calls onClose with ReceiveState on normal end', async () => {
       let finalState: ReceiveState | undefined
 
       await fetchEventSource(`${baseUrl}/with-id`, {
-        onclose(state) {
+        onClose(state) {
           finalState = state
         },
       })
@@ -249,24 +242,17 @@ async function main() {
       let attempts = 0
 
       await fetchEventSource(`${baseUrl}/break-after-3?session=${session}&total=5`, {
-        onopen() {
+        onOpen() {
           attempts++
         },
-        onmessage(event) {
+        onMessage(event) {
           messages.push(event.data)
         },
-        onclose(state) {
+        onClose(state) {
           if (attempts < 2) {
             assert(state === ReceiveState.RECEIVED, `unexpected receive state during reconnect: ${state}`)
-            throw new Error('retry to resume stream')
+            throw new RetriableError('retry to resume stream', 50)
           }
-        },
-        onerror(error, state) {
-          assert(state === ReceiveState.RECEIVED, `unexpected receive state during retry: ${state}`)
-          if (error instanceof Error && error.message === 'retry to resume stream') {
-            return 50
-          }
-          throw error
         },
       })
 
@@ -280,24 +266,17 @@ async function main() {
       const messages: string[] = []
 
       await fetchEventSource(`${baseUrl}/retry-then-break?session=${session}&retry=250&total=3`, {
-        onopen() {
+        onOpen() {
           openTimes.push(Date.now())
         },
-        onmessage(event) {
+        onMessage(event) {
           messages.push(event.data)
         },
-        onclose(state) {
+        onClose(state) {
           if (openTimes.length < 2) {
             assert(state === ReceiveState.RECEIVED, `unexpected receive state during hinted reconnect: ${state}`)
-            throw new Error('retry using server hint')
+            throw new RetriableError('retry using server hint')
           }
-        },
-        onerror(error, state) {
-          assert(state === ReceiveState.RECEIVED, `unexpected receive state during hinted retry: ${state}`)
-          if (error instanceof Error && error.message === 'retry using server hint') {
-            return
-          }
-          throw error
         },
       })
 
@@ -316,3 +295,19 @@ async function main() {
 }
 
 await main()
+
+async function assertRejects(
+  promise: Promise<unknown>,
+  check: (error: unknown) => void,
+) {
+  let rejected = false
+
+  try {
+    await promise
+  } catch (error) {
+    rejected = true
+    check(error)
+  }
+
+  assert(rejected, 'expected promise to reject')
+}

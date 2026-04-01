@@ -1,4 +1,16 @@
 export { fetchEventSource } from "./client";
-export { EventStreamContentType } from "./errors";
-export { ReceiveState } from "./types";
-export type { FetchEventSourceInit, EventSourceMessage } from "./types";
+export {
+  EventStreamContentType,
+  FatalError,
+  FetchEventSourceError,
+  ResponseError,
+  RetriableError,
+} from "./errors";
+export { FetchEventSourceDecision, ReceiveState } from "./types";
+export type {
+  ErrorDecision,
+  EventSourceMessage,
+  FetchEventSourceInit,
+  FetchEventSourceDecisionValue,
+  ResponseDecision,
+} from "./types";

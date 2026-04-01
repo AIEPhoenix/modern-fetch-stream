@@ -1,25 +1,36 @@
 import { EventSourceParserStream } from "eventsource-parser/stream";
-import { EventStreamContentType } from "./errors";
+import {
+  EventStreamContentType,
+  FatalError,
+  ResponseError,
+  RetriableError,
+} from "./errors";
+import type {
+  ErrorDecision,
+  FetchEventSourceInit,
+  ResponseDecision,
+} from "./types";
+import { FetchEventSourceDecision, ReceiveState } from "./types";
 import { setupVisibility } from "./visibility";
-import { ReceiveState } from "./types";
-import type { FetchEventSourceInit } from "./types";
 
 const DefaultRetryInterval = 1000;
 const LastEventId = "last-event-id";
 
+type NormalizedRetryDecision =
+  | { type: "fatal" }
+  | { type: "retry"; retryAfter?: number };
+
+type NormalizedResponseDecision =
+  | { type: "accept" }
+  | NormalizedRetryDecision;
+
 /**
- * A drop-in replacement for the browser `EventSource` API that uses the
- * Fetch API under the hood, giving you full control over the request
- * (method, headers, body) while retaining automatic reconnection and
- * `last-event-id` tracking.
+ * Fetch-based SSE client with automatic reconnection, `last-event-id`
+ * tracking, and pluggable response / error classification.
  *
  * SSE parsing is delegated to
  * [`eventsource-parser`](https://github.com/rexxars/eventsource-parser),
  * a spec-compliant, streaming SSE parser.
- *
- * The API surface is intentionally identical to
- * [`@microsoft/fetch-event-source`](https://github.com/Azure/fetch-event-source)
- * so that migration requires no code changes beyond swapping the import.
  *
  * @param input - The resource to fetch (URL string, `Request`, or `URL`).
  * @param init  - Fetch options extended with SSE lifecycle callbacks.
@@ -31,14 +42,15 @@ export function fetchEventSource(
   {
     signal: inputSignal,
     headers: inputHeaders,
-    onopen: inputOnOpen,
-    onmessage,
-    onclose,
-    onerror,
-    openWhenHidden,
     fetch: inputFetch,
+    openWhenHidden,
+    classifyResponse: inputClassifyResponse,
+    onOpen,
+    onMessage,
+    onClose,
+    classifyError: inputClassifyError,
     ...rest
-  }: FetchEventSourceInit,
+  }: FetchEventSourceInit = {},
 ) {
   return new Promise<void>((resolve, reject) => {
     const headers: Record<string, string> = {};
@@ -107,6 +119,14 @@ export function fetchEventSource(
       reject(error);
     }
 
+    function scheduleRetry(interval = retryInterval) {
+      clearRetryTimer();
+      retryTimer = setTimeout(() => {
+        retryTimer = undefined;
+        requestCreate();
+      }, interval);
+    }
+
     function requestCreate() {
       if (finished) return;
 
@@ -128,9 +148,6 @@ export function fetchEventSource(
       void create();
     }
 
-    // In browser environments, close the connection when the page is hidden
-    // and reopen it when the page becomes visible again — unless the caller
-    // explicitly opts out via `openWhenHidden`.
     const disposeVisibility = openWhenHidden
       ? () => {}
       : setupVisibility(
@@ -145,29 +162,63 @@ export function fetchEventSource(
         );
 
     const removeAbortListeners = externalSignals.map((signal) => {
-      const onAbort = () => resolveOnce();
-      signal.addEventListener("abort", onAbort, { once: true });
-      return () => signal.removeEventListener("abort", onAbort);
+      const abort = () => resolveOnce();
+      signal.addEventListener("abort", abort, { once: true });
+      return () => signal.removeEventListener("abort", abort);
     });
 
     const fetch = inputFetch ?? globalThis.fetch;
-    const onopen = inputOnOpen ?? defaultOnOpen;
+    const classifyResponse = inputClassifyResponse ?? defaultClassifyResponse;
+    const classifyError = inputClassifyError ?? defaultClassifyError;
 
-    /**
-     * Core connection loop. Each invocation represents a single
-     * fetch → consume → close cycle. On retriable errors the function
-     * schedules itself to run again after `retryInterval` ms.
-     */
+    async function disposeResponse(response: Response) {
+      try {
+        await response.body?.cancel();
+      } catch {
+        // Ignore body cancellation failures. The caller's retry/fatal
+        // decision should still be honored.
+      }
+    }
+
+    async function applyResponseDecision(
+      response: Response,
+      decision: NormalizedResponseDecision,
+    ) {
+      if (decision.type === "accept") return true;
+
+      const error = new ResponseError(response);
+      await disposeResponse(response);
+
+      if (decision.type === "fatal") {
+        rejectOnce(error);
+        return false;
+      }
+
+      scheduleRetry(decision.retryAfter);
+      return false;
+    }
+
+    async function handleError(error: unknown) {
+      const decision = normalizeRetryDecision(
+        await classifyError(error, receiveState),
+      );
+
+      if (decision.type === "fatal") {
+        rejectOnce(error);
+        return;
+      }
+
+      scheduleRetry(decision.retryAfter);
+    }
+
     async function create() {
       if (finished) return;
 
-      // Capture a local reference so the catch block checks the correct
-      // controller even if a new create() call overwrites curRequestController
-      // (e.g. rapid visibility toggles).
       const controller = new AbortController();
       isCreating = true;
       curRequestController = controller;
       receiveState = ReceiveState.IDLE;
+
       try {
         const response = await fetch(input, {
           ...rest,
@@ -175,14 +226,20 @@ export function fetchEventSource(
           signal: controller.signal,
         });
 
-        await onopen(response);
+        const responseDecision = normalizeResponseDecision(
+          await classifyResponse(response),
+        );
 
-        if (!response.body) {
-          throw new Error("Response body is null");
+        if (!(await applyResponseDecision(response, responseDecision))) {
+          return;
         }
 
-        // Build the streaming pipeline:
-        //   raw bytes → text chunks → parsed SSE messages
+        await onOpen?.(response);
+
+        if (!response.body) {
+          throw new FatalError("Response body is null");
+        }
+
         const eventStream = response.body
           .pipeThrough(new TextDecoderStream())
           .pipeThrough(
@@ -193,15 +250,12 @@ export function fetchEventSource(
             }),
           );
 
-        // Consume messages one by one.
         const reader = eventStream.getReader();
         try {
           for (;;) {
             const { done, value: event } = await reader.read();
             if (done) break;
 
-            // Track the last event id so it can be sent back on reconnection,
-            // allowing the server to resume from where it left off.
             if (event.id !== undefined) {
               if (event.id) {
                 headers[LastEventId] = event.id;
@@ -210,38 +264,24 @@ export function fetchEventSource(
                 delete headers[LastEventId];
                 receiveState = ReceiveState.RECEIVED_NO_ID;
               }
-            } else {
-              // Message without id field at all
-              if (receiveState === ReceiveState.IDLE) {
-                receiveState = ReceiveState.RECEIVED_NO_ID;
-              }
+            } else if (receiveState === ReceiveState.IDLE) {
+              receiveState = ReceiveState.RECEIVED_NO_ID;
             }
 
-            onmessage?.(event);
+            await onMessage?.(event);
           }
         } finally {
           reader.releaseLock();
         }
 
-        // Stream ended cleanly — notify the caller and resolve.
-        onclose?.(receiveState);
+        await onClose?.(receiveState);
         resolveOnce();
-      } catch (err) {
-        // If we aborted the request ourselves (visibility change, caller
-        // signal, etc.) there is nothing to retry — just bail out.
+      } catch (error) {
         if (!finished && !controller.signal.aborted) {
           try {
-            // Let the caller decide the retry interval. Returning a number
-            // overrides the default; returning nothing keeps it; throwing
-            // aborts the whole operation.
-            const interval = onerror?.(err, receiveState) ?? retryInterval;
-            clearRetryTimer();
-            retryTimer = setTimeout(() => {
-              retryTimer = undefined;
-              requestCreate();
-            }, interval);
-          } catch (innerErr) {
-            rejectOnce(innerErr);
+            await handleError(error);
+          } catch (innerError) {
+            rejectOnce(innerError);
           }
         }
       } finally {
@@ -257,20 +297,62 @@ export function fetchEventSource(
   });
 }
 
-/**
- * Default response validator — ensures the server actually sent an
- * event stream rather than, say, an HTML error page.
- */
-function defaultOnOpen(response: Response) {
+function defaultClassifyResponse(response: Response): ResponseDecision {
   const contentType = response.headers.get("content-type");
-  if (!contentType?.startsWith(EventStreamContentType)) {
-    throw new Error(
-      `Expected content-type to be ${EventStreamContentType}, Actual: ${contentType}`,
-    );
-  }
+  return response.ok && contentType?.startsWith(EventStreamContentType)
+    ? FetchEventSourceDecision.Accept
+    : FetchEventSourceDecision.Fatal;
 }
 
-function copyHeaders(target: Record<string, string>, source?: HeadersInit) {
+function defaultClassifyError(error: unknown): ErrorDecision {
+  if (error instanceof RetriableError) {
+    return error.retryAfter === undefined
+      ? FetchEventSourceDecision.Retry
+      : { retryAfter: error.retryAfter };
+  }
+
+  if (error instanceof FatalError || error instanceof ResponseError) {
+    return FetchEventSourceDecision.Fatal;
+  }
+
+  return FetchEventSourceDecision.Retry;
+}
+
+function normalizeResponseDecision(
+  decision: ResponseDecision,
+): NormalizedResponseDecision {
+  if (decision === FetchEventSourceDecision.Accept) {
+    return { type: "accept" };
+  }
+
+  return normalizeRetryDecision(decision);
+}
+
+function normalizeRetryDecision(
+  decision: ErrorDecision,
+): NormalizedRetryDecision {
+  if (decision === FetchEventSourceDecision.Fatal) {
+    return { type: "fatal" };
+  }
+
+  if (decision === FetchEventSourceDecision.Retry) {
+    return { type: "retry" };
+  }
+
+  const retryAfter = decision.retryAfter;
+  if (!Number.isFinite(retryAfter) || retryAfter < 0) {
+    throw new TypeError(
+      `retryAfter must be a finite non-negative number, received: ${retryAfter}`,
+    );
+  }
+
+  return { type: "retry", retryAfter };
+}
+
+function copyHeaders(
+  target: Record<string, string>,
+  source?: HeadersInit,
+) {
   if (!source) return;
 
   new Headers(source).forEach((value, key) => {
