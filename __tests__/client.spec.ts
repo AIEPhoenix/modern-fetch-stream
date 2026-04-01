@@ -963,4 +963,463 @@ describe("fetchEventSource", () => {
     expect(FetchEventSourceCloseReason.Eof).toBe("eof");
     expect(FetchEventSourceCloseReason.Aborted).toBe("aborted");
   });
+
+  // -----------------------------------------------------------------------
+  // Gap coverage: onOpen throwing
+  // -----------------------------------------------------------------------
+
+  it("routes onOpen errors through classifyError", async () => {
+    vi.useFakeTimers();
+    let callCount = 0;
+    const mockFetch = vi.fn().mockImplementation(() => {
+      callCount++;
+      return Promise.resolve(mockSSEResponse([sseChunk("data: ok")]));
+    });
+
+    const promise = fetchEventSource("http://test/sse", {
+      fetch: mockFetch,
+      onOpen() {
+        if (callCount === 1) throw new Error("onOpen boom");
+      },
+      onMessage() {},
+    });
+
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(1000);
+    await promise;
+
+    expect(callCount).toBe(2);
+    vi.useRealTimers();
+  });
+
+  it("rejects when onOpen throws and classifyError returns fatal", async () => {
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValue(mockSSEResponse([sseChunk("data: ok")]));
+
+    await expect(
+      fetchEventSource("http://test/sse", {
+        fetch: mockFetch,
+        onOpen() {
+          throw new Error("onOpen fatal");
+        },
+        classifyError() {
+          return FetchEventSourceDecision.Fatal;
+        },
+      }),
+    ).rejects.toThrow("onOpen fatal");
+  });
+
+  // -----------------------------------------------------------------------
+  // Gap coverage: classifyResponse returning plain "retry"
+  // -----------------------------------------------------------------------
+
+  it("retries with default interval when classifyResponse returns Retry", async () => {
+    vi.useFakeTimers();
+    let callCount = 0;
+    const mockFetch = vi.fn().mockImplementation(() => {
+      callCount++;
+      if (callCount === 1) {
+        return Promise.resolve(
+          mockSSEResponse([sseChunk("data: no")], { status: 503 }),
+        );
+      }
+      return Promise.resolve(mockSSEResponse([sseChunk("data: ok")]));
+    });
+
+    const promise = fetchEventSource("http://test/sse", {
+      fetch: mockFetch,
+      classifyResponse(response) {
+        return response.ok
+          ? FetchEventSourceDecision.Accept
+          : FetchEventSourceDecision.Retry;
+      },
+      onMessage() {},
+    });
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(callCount).toBe(1);
+    await vi.advanceTimersByTimeAsync(1000);
+    await promise;
+
+    expect(callCount).toBe(2);
+    vi.useRealTimers();
+  });
+
+  // -----------------------------------------------------------------------
+  // Gap coverage: async classifyResponse / classifyError
+  // -----------------------------------------------------------------------
+
+  it("supports async classifyResponse", async () => {
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValue(mockSSEResponse([sseChunk("data: ok")]));
+    const messages: string[] = [];
+
+    await fetchEventSource("http://test/sse", {
+      fetch: mockFetch,
+      async classifyResponse(response) {
+        await Promise.resolve();
+        return response.ok
+          ? FetchEventSourceDecision.Accept
+          : FetchEventSourceDecision.Fatal;
+      },
+      onMessage(event) {
+        messages.push(event.data);
+      },
+    });
+
+    expect(messages).toEqual(["ok"]);
+  });
+
+  it("supports async classifyError", async () => {
+    vi.useFakeTimers();
+    let callCount = 0;
+    const mockFetch = vi.fn().mockImplementation(() => {
+      callCount++;
+      if (callCount === 1) return Promise.reject(new Error("fail"));
+      return Promise.resolve(mockSSEResponse([sseChunk("data: ok")]));
+    });
+
+    const promise = fetchEventSource("http://test/sse", {
+      fetch: mockFetch,
+      async classifyError() {
+        await Promise.resolve();
+        return { retryAfter: 100 };
+      },
+      onMessage() {},
+    });
+
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(100);
+    await promise;
+
+    expect(callCount).toBe(2);
+    vi.useRealTimers();
+  });
+
+  // -----------------------------------------------------------------------
+  // Gap coverage: classifyError receives correct receiveState
+  // -----------------------------------------------------------------------
+
+  it("passes IDLE receiveState to classifyError when error occurs before any messages", async () => {
+    const receivedStates: string[] = [];
+    const mockFetch = vi.fn().mockRejectedValue(new Error("fail"));
+
+    await expect(
+      fetchEventSource("http://test/sse", {
+        fetch: mockFetch,
+        classifyError(_error, receiveState) {
+          receivedStates.push(receiveState);
+          return FetchEventSourceDecision.Fatal;
+        },
+      }),
+    ).rejects.toThrow("fail");
+
+    expect(receivedStates).toEqual([ReceiveState.IDLE]);
+  });
+
+  it("passes RECEIVED receiveState to classifyError when messages with id were received", async () => {
+    const receivedStates: string[] = [];
+    const encoder = new TextEncoder();
+    const mockFetch = vi.fn().mockImplementation(() => {
+      let sent = false;
+      const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (!sent) {
+            controller.enqueue(
+              encoder.encode(sseChunk("id: 1", "data: hi")),
+            );
+            sent = true;
+          } else {
+            controller.error(new Error("mid-stream fail"));
+          }
+        },
+      });
+      return Promise.resolve(
+        new Response(body, {
+          status: 200,
+          headers: { "content-type": EventStreamContentType },
+        }),
+      );
+    });
+
+    await expect(
+      fetchEventSource("http://test/sse", {
+        fetch: mockFetch,
+        onMessage() {},
+        classifyError(_error, receiveState) {
+          receivedStates.push(receiveState);
+          return FetchEventSourceDecision.Fatal;
+        },
+      }),
+    ).rejects.toThrow("mid-stream fail");
+
+    expect(receivedStates).toEqual([ReceiveState.RECEIVED]);
+  });
+
+  it("passes RECEIVED_NO_ID receiveState to classifyError when messages without id were received", async () => {
+    const receivedStates: string[] = [];
+    const encoder = new TextEncoder();
+    const mockFetch = vi.fn().mockImplementation(() => {
+      let sent = false;
+      const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (!sent) {
+            controller.enqueue(encoder.encode(sseChunk("data: hi")));
+            sent = true;
+          } else {
+            controller.error(new Error("mid-stream fail"));
+          }
+        },
+      });
+      return Promise.resolve(
+        new Response(body, {
+          status: 200,
+          headers: { "content-type": EventStreamContentType },
+        }),
+      );
+    });
+
+    await expect(
+      fetchEventSource("http://test/sse", {
+        fetch: mockFetch,
+        onMessage() {},
+        classifyError(_error, receiveState) {
+          receivedStates.push(receiveState);
+          return FetchEventSourceDecision.Fatal;
+        },
+      }),
+    ).rejects.toThrow("mid-stream fail");
+
+    expect(receivedStates).toEqual([ReceiveState.RECEIVED_NO_ID]);
+  });
+
+  // -----------------------------------------------------------------------
+  // Gap coverage: openWhenHidden
+  // -----------------------------------------------------------------------
+
+  it("keeps the connection alive when openWhenHidden is true", async () => {
+    const mockDocument = installMockDocument();
+    const mockFetch = vi.fn().mockImplementation(
+      () =>
+        new Promise(() => {
+          // Never resolves — simulates an open connection
+        }),
+    );
+
+    try {
+      const controller = new AbortController();
+      const closePromise = fetchEventSource("http://test/sse", {
+        fetch: mockFetch,
+        openWhenHidden: true,
+        signal: controller.signal,
+        onClose() {},
+      });
+
+      await Promise.resolve();
+      expect(mockFetch).toHaveBeenCalledOnce();
+
+      // Hiding the page should NOT abort the request
+      mockDocument.setHidden(true);
+      mockDocument.dispatchVisibilityChange();
+      await Promise.resolve();
+
+      // fetch is still the same call — no abort, no new fetch
+      expect(mockFetch).toHaveBeenCalledOnce();
+
+      controller.abort();
+      await closePromise;
+    } finally {
+      mockDocument.restore();
+    }
+  });
+
+  // -----------------------------------------------------------------------
+  // Gap coverage: invalid retryAfter validation
+  // -----------------------------------------------------------------------
+
+  it("rejects with TypeError when classifyError returns negative retryAfter", async () => {
+    const mockFetch = vi.fn().mockRejectedValue(new Error("fail"));
+
+    await expect(
+      fetchEventSource("http://test/sse", {
+        fetch: mockFetch,
+        classifyError() {
+          return { retryAfter: -1 };
+        },
+      }),
+    ).rejects.toThrow(TypeError);
+  });
+
+  it("rejects with TypeError when classifyError returns NaN retryAfter", async () => {
+    const mockFetch = vi.fn().mockRejectedValue(new Error("fail"));
+
+    await expect(
+      fetchEventSource("http://test/sse", {
+        fetch: mockFetch,
+        classifyError() {
+          return { retryAfter: NaN };
+        },
+      }),
+    ).rejects.toThrow(TypeError);
+  });
+
+  it("rejects with TypeError when classifyError returns Infinity retryAfter", async () => {
+    const mockFetch = vi.fn().mockRejectedValue(new Error("fail"));
+
+    await expect(
+      fetchEventSource("http://test/sse", {
+        fetch: mockFetch,
+        classifyError() {
+          return { retryAfter: Infinity };
+        },
+      }),
+    ).rejects.toThrow(TypeError);
+  });
+
+  // -----------------------------------------------------------------------
+  // Gap coverage: classifyError itself throwing
+  // -----------------------------------------------------------------------
+
+  it("rejects when classifyError itself throws", async () => {
+    const mockFetch = vi.fn().mockRejectedValue(new Error("original"));
+
+    await expect(
+      fetchEventSource("http://test/sse", {
+        fetch: mockFetch,
+        classifyError() {
+          throw new Error("classifier exploded");
+        },
+      }),
+    ).rejects.toThrow("classifier exploded");
+  });
+
+  // -----------------------------------------------------------------------
+  // Gap coverage: Request input signal triggers abort
+  // -----------------------------------------------------------------------
+
+  it("aborts when Request input signal fires", async () => {
+    const controller = new AbortController();
+    const onClose = vi.fn();
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValue(mockSSEResponse([sseChunk("data: 1")], { delay: 50 }));
+
+    const request = new Request("http://test/sse", {
+      signal: controller.signal,
+    });
+
+    setTimeout(() => controller.abort(), 10);
+
+    await fetchEventSource(request, {
+      fetch: mockFetch,
+      onClose,
+    });
+
+    expect(onClose).toHaveBeenCalledWith({
+      reason: FetchEventSourceCloseReason.Aborted,
+      receiveState: ReceiveState.IDLE,
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Gap coverage: onClose EOF throwing FatalError → classifyError → fatal
+  // -----------------------------------------------------------------------
+
+  it("rejects when onClose throws FatalError on EOF", async () => {
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValue(mockSSEResponse([sseChunk("data: first")]));
+
+    await expect(
+      fetchEventSource("http://test/sse", {
+        fetch: mockFetch,
+        onMessage() {},
+        onClose() {
+          throw new FatalError("unwanted close");
+        },
+      }),
+    ).rejects.toThrow("unwanted close");
+
+    expect(mockFetch).toHaveBeenCalledOnce();
+  });
+
+  // -----------------------------------------------------------------------
+  // Gap coverage: multiple consecutive retries
+  // -----------------------------------------------------------------------
+
+  it("retries multiple times before succeeding", async () => {
+    vi.useFakeTimers();
+    let callCount = 0;
+    const mockFetch = vi.fn().mockImplementation(() => {
+      callCount++;
+      if (callCount <= 3) return Promise.reject(new Error(`fail-${callCount}`));
+      return Promise.resolve(mockSSEResponse([sseChunk("data: ok")]));
+    });
+
+    const promise = fetchEventSource("http://test/sse", {
+      fetch: mockFetch,
+      onMessage() {},
+    });
+
+    // 3 retries at 1s each
+    for (let i = 0; i < 3; i++) {
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(1000);
+    }
+    await promise;
+
+    expect(callCount).toBe(4);
+    vi.useRealTimers();
+  });
+
+  // -----------------------------------------------------------------------
+  // Gap coverage: async onMessage backpressure (serial execution)
+  // -----------------------------------------------------------------------
+
+  it("awaits async onMessage handlers serially", async () => {
+    const order: number[] = [];
+    const mockFetch = vi.fn().mockResolvedValue(
+      mockSSEResponse([
+        sseChunk("data: 1"),
+        sseChunk("data: 2"),
+        sseChunk("data: 3"),
+      ]),
+    );
+
+    await fetchEventSource("http://test/sse", {
+      fetch: mockFetch,
+      async onMessage(event) {
+        const n = Number(event.data);
+        // Stagger delays: message 1 takes longest, message 3 is instant.
+        // If parallel, 3 would finish before 1.
+        await new Promise((resolve) => setTimeout(resolve, (4 - n) * 10));
+        order.push(n);
+      },
+    });
+
+    expect(order).toEqual([1, 2, 3]);
+  });
+
+  // -----------------------------------------------------------------------
+  // Gap coverage: URL object as input
+  // -----------------------------------------------------------------------
+
+  it("accepts a URL object as input", async () => {
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValue(mockSSEResponse([sseChunk("data: ok")]));
+
+    const messages: string[] = [];
+    await fetchEventSource(new URL("http://test/sse"), {
+      fetch: mockFetch,
+      onMessage(event) {
+        messages.push(event.data);
+      },
+    });
+
+    expect(messages).toEqual(["ok"]);
+    expect(mockFetch).toHaveBeenCalledOnce();
+  });
 });

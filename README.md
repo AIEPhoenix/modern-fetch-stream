@@ -203,7 +203,7 @@ sequenceDiagram
 
 ### Error classes
 
-The library exports four error classes:
+The library exports four error classes, all inheriting from `FetchEventSourceError`:
 
 ```ts
 import {
@@ -214,10 +214,12 @@ import {
 } from 'modern-fetch-stream'
 ```
 
-- `FetchEventSourceError`: base class for library-defined errors.
-- `ResponseError`: wraps a rejected HTTP response and exposes `response`.
-- `FatalError`: default fatal classification.
-- `RetriableError`: default retriable classification and optional `retryAfter`.
+| Class | `code` | Description |
+|-------|--------|-------------|
+| `FetchEventSourceError` | — | Abstract base class. Every subclass carries a unique string `code` for programmatic matching. |
+| `ResponseError` | `RESPONSE_ERROR` | Wraps a rejected HTTP `Response` object, exposed via `error.response`. |
+| `FatalError` | `FATAL_ERROR` | Signals an unrecoverable error — stops retrying immediately. |
+| `RetriableError` | `RETRIABLE_ERROR` | Signals a transient error. Optional `retryAfter` (ms) overrides the current retry interval. |
 
 ### Other exports
 
@@ -228,12 +230,26 @@ import {
   FetchEventSourceDecision,
   ReceiveState,
 } from 'modern-fetch-stream'
+
+// Type-level exports (useful for typing your own classifier functions):
+import type {
+  ErrorDecision,
+  ResponseDecision,
+  EventSourceMessage,
+  FetchEventSourceClose,
+  FetchEventSourceInit,
+  FetchEventSourceDecisionValue,
+  FetchEventSourceCloseReasonValue,
+} from 'modern-fetch-stream'
 ```
 
 - `EventStreamContentType`: the standard `text/event-stream` MIME type.
 - `FetchEventSourceCloseReason`: runtime close-reason constants for `Eof` and `Aborted`.
 - `FetchEventSourceDecision`: runtime decision constants for `Accept`, `Retry`, and `Fatal`.
 - `ReceiveState`: final stream receive state passed to `onClose` and `classifyError`.
+- `ErrorDecision` / `ResponseDecision`: return types for `classifyError` and `classifyResponse`.
+- `FetchEventSourceClose`: payload type for the `onClose` callback.
+- `EventSourceMessage`: re-exported from `eventsource-parser`.
 
 ### Decision constants
 
@@ -410,7 +426,14 @@ Visibility-driven internal aborts do not surface as `reason: "aborted"`. That cl
 
 ## Request input support
 
-`fetchEventSource` accepts a URL, `Request`, or `URL` object. When you pass a `Request`, its headers and signal are preserved and merged with the explicit `init` options. The library normalizes header names to lowercase so it can safely manage `accept` and `last-event-id`.
+`fetchEventSource` accepts a URL string, `Request`, or `URL` object as its first argument.
+
+When you pass a `Request`:
+- Its headers are merged (lowercase-normalized) into the final header set.
+- Its `signal` is respected alongside any explicit `signal` in the options — either signal aborting will close the stream.
+- Explicit `init` options take precedence over the `Request`'s properties.
+
+The library normalizes all header names to lowercase so it can safely manage `accept` and `last-event-id` without collisions.
 
 ## License
 

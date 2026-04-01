@@ -2,6 +2,10 @@ import type { EventSourceMessage } from "eventsource-parser";
 
 export type { EventSourceMessage };
 
+// ---------------------------------------------------------------------------
+// Enums and constants
+// ---------------------------------------------------------------------------
+
 /**
  * Describes the data receive state of the SSE stream at close time.
  *
@@ -17,28 +21,62 @@ export enum ReceiveState {
   RECEIVED_NO_ID = "RECEIVED_NO_ID",
 }
 
+/**
+ * Constants returned from `classifyResponse` and `classifyError` to tell
+ * the library how to proceed.
+ *
+ * - `Accept` — (response only) consume the response body as an SSE stream.
+ * - `Retry`  — discard and reconnect using the current retry interval.
+ * - `Fatal`  — stop retrying and reject the returned promise.
+ */
 export const FetchEventSourceDecision = {
   Accept: "accept",
   Retry: "retry",
   Fatal: "fatal",
 } as const;
 
+/**
+ * Reason constants passed to `onClose`.
+ *
+ * - `Eof`     — the server closed the response body normally.
+ * - `Aborted` — the caller cancelled via `AbortSignal`.
+ */
 export const FetchEventSourceCloseReason = {
   Eof: "eof",
   Aborted: "aborted",
 } as const;
 
+// ---------------------------------------------------------------------------
+// Derived literal types
+// ---------------------------------------------------------------------------
+
+/** Union of all decision string values (`"accept" | "retry" | "fatal"`). */
 export type FetchEventSourceDecisionValue =
   (typeof FetchEventSourceDecision)[keyof typeof FetchEventSourceDecision];
 
+/** Union of all close reason string values (`"eof" | "aborted"`). */
 export type FetchEventSourceCloseReasonValue =
   (typeof FetchEventSourceCloseReason)[keyof typeof FetchEventSourceCloseReason];
 
+// ---------------------------------------------------------------------------
+// Callback payload and decision types
+// ---------------------------------------------------------------------------
+
+/** Payload delivered to the `onClose` callback. */
 export interface FetchEventSourceClose {
+  /** Why the stream closed — server EOF or caller abort. */
   reason: FetchEventSourceCloseReasonValue;
+  /** What the stream had delivered before it closed. */
   receiveState: ReceiveState;
 }
 
+/**
+ * What `classifyError` may return.
+ *
+ * - `"retry"` — reconnect using the current interval.
+ * - `"fatal"` — give up.
+ * - `{ retryAfter: number }` — reconnect after a specific delay (ms).
+ */
 export type ErrorDecision =
   | Exclude<
       FetchEventSourceDecisionValue,
@@ -46,9 +84,18 @@ export type ErrorDecision =
     >
   | { retryAfter: number };
 
+/**
+ * What `classifyResponse` may return.
+ *
+ * Includes every `ErrorDecision` variant plus `"accept"`.
+ */
 export type ResponseDecision =
   | FetchEventSourceDecisionValue
   | { retryAfter: number };
+
+// ---------------------------------------------------------------------------
+// Init options
+// ---------------------------------------------------------------------------
 
 /**
  * Options for {@link fetchEventSource}. Extends the standard `RequestInit`
