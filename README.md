@@ -36,6 +36,8 @@ npm install modern-fetch-stream
 - `onMessage` can be async and is awaited serially.
 - The default response policy now accepts only `2xx` `text/event-stream` responses.
 
+See the [changelog](./CHANGELOG.md) for the full release history, including the `1.0.1` state-machine and resource-handling fixes.
+
 ## Quick start
 
 ```ts
@@ -103,6 +105,8 @@ If you used the pre-`1.0.0` API, the main mapping is:
 |-----------|------|-------------|
 | `input` | `RequestInfo \| URL` | The resource to fetch. |
 | `init` | `FetchEventSourceInit` | Fetch options extended with SSE callbacks and classifiers. |
+
+> **Reconnection caveat for `Request` inputs with a body.** The library reuses the same `input` for every reconnection attempt. A `Request` whose body has been consumed by the first attempt cannot be replayed by native `fetch` and will throw on retry. For automatically reconnecting POST/PUT requests, prefer passing a URL string plus `body` (so the body string is sent fresh each time), or build a new `Request` per attempt outside the library.
 
 At a high level, the library has three phases:
 

@@ -1,6 +1,6 @@
 {
   "name": "modern-fetch-stream",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Modern, robust Server-Sent Events client built on fetch API and eventsource-parser",
   "type": "module",
   "exports": {
@@ -15,10 +15,14 @@
   "types": "./dist/index.d.ts",
   "files": [
     "dist",
+    "src",
     "LICENSE",
     "README.md"
   ],
   "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "build": "tsup",
     "check": "tsc --noEmit",

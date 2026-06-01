@@ -92,7 +92,12 @@ export function fetchEventSource(
 
     /** AbortController for the *current* in-flight fetch request. */
     let curRequestController: AbortController | undefined;
-    /** Active retry interval (ms). Updated by server-sent `retry:` fields. */
+    /**
+     * Active retry interval (ms). A server-sent `retry:` field updates this,
+     * and the new value persists across subsequent reconnections — matching
+     * the EventSource spec, where the reconnection time is remembered rather
+     * than reset per connection.
+     */
     let retryInterval = DefaultRetryInterval;
     /** Handle for a pending `setTimeout`-based retry. */
     let retryTimer: ReturnType<typeof setTimeout> | undefined;
@@ -174,10 +179,20 @@ export function fetchEventSource(
      * abort-path errors bypass `classifyError` intentionally.
      */
     async function resolveClosed(close: FetchEventSourceClose) {
-      if (finished || closeCalled) return;
-      closeCalled = true;
+      if (finished) return;
       stop();
 
+      // An EOF close may have already invoked `onClose` for this attempt and,
+      // if that callback threw, scheduled a retry. An external abort during
+      // that retry window must still terminate: `stop()` above cleared the
+      // pending timer, so just resolve — without invoking `onClose` a second
+      // time, since it already fired for this connection.
+      if (closeCalled) {
+        resolve();
+        return;
+      }
+
+      closeCalled = true;
       try {
         await onClose?.(close);
         resolve();
@@ -188,6 +203,26 @@ export function fetchEventSource(
 
     /** Reject the outer promise with a fatal error. */
     function rejectOnce(error: unknown) {
+      // An abort may have already settled the promise (via `resolveClosed`)
+      // while an async classifier was in flight. Don't let a stale error
+      // race past it.
+      if (finished) return;
+      stop();
+      reject(error);
+    }
+
+    /**
+     * Reject without aborting the current fetch controller. Used by the
+     * fatal-response path so the caller can still read `ResponseError.response`
+     * (e.g. `await error.response.text()`); aborting the controller before
+     * rejecting would error the body in native `fetch`.
+     */
+    function rejectKeepingResponse(error: unknown) {
+      // Same race guard as `rejectOnce` — an abort during `await
+      // classifyResponse` must win over a fatal verdict that arrives late.
+      if (finished) return;
+      // Drop our reference so `stop()` -> `abortCurrentRequest()` is a no-op.
+      curRequestController = undefined;
       stop();
       reject(error);
     }
@@ -198,6 +233,7 @@ export function fetchEventSource(
 
     /** Schedule a reconnection attempt after `interval` ms. */
     function scheduleRetry(interval = retryInterval) {
+      if (finished) return;
       clearRetryTimer();
       retryTimer = setTimeout(() => {
         retryTimer = undefined;
@@ -314,14 +350,19 @@ export function fetchEventSource(
     ) {
       if (decision.type === "accept") return true;
 
-      const error = new ResponseError(response);
-      await disposeResponse(response);
-
       if (decision.type === "fatal") {
-        rejectOnce(error);
+        // Reject with the response intact so the caller can inspect its
+        // status, headers, and body (e.g. read an error payload). Ownership
+        // of the body transfers to the caller — we must not cancel it here,
+        // and we must not abort the fetch controller (native `fetch` errors
+        // the body on signal abort).
+        rejectKeepingResponse(new ResponseError(response));
         return false;
       }
 
+      // Retry: the caller never sees this response, so release its body to
+      // avoid leaking a connection on every reconnection attempt.
+      await disposeResponse(response);
       scheduleRetry(decision.retryAfter);
       return false;
     }
@@ -334,6 +375,12 @@ export function fetchEventSource(
       const decision = normalizeRetryDecision(
         await classifyError(error, receiveState),
       );
+
+      // `classifyError` may be async; an abort during its await must win
+      // over a stale fatal/retry verdict. (Both `rejectOnce` and
+      // `scheduleRetry` also guard on `finished`, but checking here keeps
+      // the intent explicit.)
+      if (finished) return;
 
       if (decision.type === "fatal") {
         rejectOnce(error);
@@ -367,6 +414,9 @@ export function fetchEventSource(
       isCreating = true;
       curRequestController = controller;
       receiveState = ReceiveState.IDLE;
+      // Reset per attempt. `resolveClosed` reads this to know whether the
+      // current attempt already fired `onClose` (e.g. via EOF) so an abort
+      // arriving during a subsequent retry-window doesn't duplicate it.
       closeCalled = false;
 
       try {
@@ -381,12 +431,39 @@ export function fetchEventSource(
           await classifyResponse(response),
         );
 
+        // `classifyResponse` may be async; an abort (external or visibility)
+        // can land while it awaits. Re-check before acting on the decision:
+        // the retry/fatal branches have downstream guards in `scheduleRetry`
+        // and `rejectKeepingResponse`, but the accept branch falls straight
+        // into `await onOpen`, which has no guard of its own. Without this
+        // check, an abort during `await classifyResponse` would still fire
+        // the user's `onOpen` callback on a stream the caller cancelled.
+        if (finished || controller.signal.aborted) {
+          await disposeResponse(response);
+          return;
+        }
+
         if (!(await applyResponseDecision(response, responseDecision))) {
           return;
         }
 
         // --- Phase 2: notify the caller and begin streaming ---
-        await onOpen?.(response);
+        try {
+          await onOpen?.(response);
+        } catch (error) {
+          // `onOpen` rejected on an accepted response whose body was never
+          // consumed. Cancel it so the connection is released before the
+          // error routes through `classifyError` (which may retry).
+          await disposeResponse(response);
+          throw error;
+        }
+
+        // `onOpen` is also awaited — an abort during it must not let the
+        // read loop start. Re-check once more before opening the pipeline.
+        if (finished || controller.signal.aborted) {
+          await disposeResponse(response);
+          return;
+        }
 
         if (!response.body) {
           throw new FatalError("Response body is null");
@@ -431,6 +508,13 @@ export function fetchEventSource(
 
             await onMessage?.(event);
           }
+        } catch (error) {
+          // A read failure or `onMessage` rejection leaves the parser pipeline
+          // open. Cancel it — this propagates upstream to the response body,
+          // releasing the connection — before the error routes through
+          // `classifyError` (which may schedule a retry).
+          await reader.cancel().catch(() => {});
+          throw error;
         } finally {
           reader.releaseLock();
         }
@@ -483,8 +567,15 @@ export function fetchEventSource(
  * starts with `text/event-stream`. Everything else is treated as fatal.
  */
 function defaultClassifyResponse(response: Response): ResponseDecision {
-  const contentType = response.headers.get("content-type");
-  return response.ok && contentType?.startsWith(EventStreamContentType)
+  // Compare the media type by its `;`-delimited boundary (case-insensitively)
+  // rather than a raw prefix: accept `text/event-stream; charset=utf-8` but
+  // reject look-alikes such as `text/event-streamevil`.
+  const mediaType = response.headers
+    .get("content-type")
+    ?.split(";", 1)[0]
+    .trim()
+    .toLowerCase();
+  return response.ok && mediaType === EventStreamContentType
     ? FetchEventSourceDecision.Accept
     : FetchEventSourceDecision.Fatal;
 }

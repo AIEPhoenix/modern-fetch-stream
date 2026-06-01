@@ -1422,4 +1422,505 @@ describe("fetchEventSource", () => {
     expect(messages).toEqual(["ok"]);
     expect(mockFetch).toHaveBeenCalledOnce();
   });
+
+  // -----------------------------------------------------------------------
+  // Regression (H1): error paths must release the response body, not just
+  // drop the reference and rely on GC.
+  // -----------------------------------------------------------------------
+
+  it("cancels the response body when onMessage throws and a retry is scheduled", async () => {
+    vi.useFakeTimers();
+    const cancelSpy = vi.fn();
+    let callCount = 0;
+    const mockFetch = vi.fn().mockImplementation(() => {
+      callCount++;
+      if (callCount === 1) {
+        const encoder = new TextEncoder();
+        const body = new ReadableStream<Uint8Array>({
+          pull(controller) {
+            controller.enqueue(encoder.encode(sseChunk("data: 1")));
+          },
+          cancel: cancelSpy,
+        });
+        return Promise.resolve(
+          new Response(body, {
+            status: 200,
+            headers: { "content-type": EventStreamContentType },
+          }),
+        );
+      }
+      return Promise.resolve(mockSSEResponse([sseChunk("data: ok")]));
+    });
+
+    let thrown = false;
+    const promise = fetchEventSource("http://test/sse", {
+      fetch: mockFetch,
+      classifyError() {
+        return { retryAfter: 0 };
+      },
+      onMessage() {
+        if (!thrown) {
+          thrown = true;
+          throw new Error("boom");
+        }
+      },
+    });
+
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(0);
+    await promise;
+
+    expect(cancelSpy).toHaveBeenCalled();
+    expect(callCount).toBe(2);
+    vi.useRealTimers();
+  });
+
+  it("cancels the response body when onOpen throws", async () => {
+    const cancelSpy = vi.fn();
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.enqueue(new TextEncoder().encode(sseChunk("data: 1")));
+      },
+      cancel: cancelSpy,
+    });
+    const mockFetch = vi.fn().mockResolvedValue(
+      new Response(body, {
+        status: 200,
+        headers: { "content-type": EventStreamContentType },
+      }),
+    );
+
+    await expect(
+      fetchEventSource("http://test/sse", {
+        fetch: mockFetch,
+        onOpen() {
+          throw new FatalError("open failed");
+        },
+      }),
+    ).rejects.toThrow("open failed");
+
+    expect(cancelSpy).toHaveBeenCalled();
+  });
+
+  // -----------------------------------------------------------------------
+  // Regression (H2): an external abort during the retry window opened by an
+  // `onClose(eof)` that threw must still terminate the stream — it must not
+  // be swallowed by the `closeCalled` guard (which would hang the promise
+  // forever and leave the retry timer running).
+  // -----------------------------------------------------------------------
+
+  it("lets an external abort terminate after onClose throws on eof", async () => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const onClose = vi.fn((close: { reason: string }) => {
+      if (close.reason === FetchEventSourceCloseReason.Eof) {
+        throw new RetriableError("retry after eof");
+      }
+    });
+    let callCount = 0;
+    const mockFetch = vi.fn().mockImplementation(() => {
+      callCount++;
+      return Promise.resolve(mockSSEResponse([sseChunk("data: 1")]));
+    });
+
+    const promise = fetchEventSource("http://test/sse", {
+      fetch: mockFetch,
+      signal: controller.signal,
+      onClose,
+      onMessage() {},
+    });
+
+    // First connection reaches EOF -> onClose(eof) throws -> retry scheduled.
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(onClose).toHaveBeenCalledOnce();
+
+    // Abort during the retry wait window. The promise must resolve (not hang
+    // or reject), onClose must not fire a second time, and no retry fetch
+    // may occur after the timer would have elapsed.
+    controller.abort();
+    await promise;
+
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(onClose).toHaveBeenCalledOnce();
+    expect(onClose).toHaveBeenCalledWith({
+      reason: FetchEventSourceCloseReason.Eof,
+      receiveState: ReceiveState.RECEIVED_NO_ID,
+    });
+    expect(callCount).toBe(1);
+    vi.useRealTimers();
+  });
+
+  // -----------------------------------------------------------------------
+  // Regression (M2): a fatal ResponseError must expose a still-readable body
+  // so callers can inspect the error payload.
+  // -----------------------------------------------------------------------
+
+  it("preserves the response body on a fatal ResponseError", async () => {
+    const mockFetch = vi.fn().mockResolvedValue(
+      new Response('{"error":"nope"}', {
+        status: 401,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
+    let caught: unknown;
+    try {
+      await fetchEventSource("http://test/sse", { fetch: mockFetch });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(ResponseError);
+    const text = await (caught as ResponseError).response.text();
+    expect(text).toBe('{"error":"nope"}');
+  });
+
+  // -----------------------------------------------------------------------
+  // Regression (M1): an abort while an async classifyResponse is in flight
+  // must not leak into onOpen / the read loop.
+  // -----------------------------------------------------------------------
+
+  it("does not call onOpen when aborted during an async classifyResponse", async () => {
+    const controller = new AbortController();
+    const onOpen = vi.fn();
+    const onClose = vi.fn();
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValue(mockSSEResponse([sseChunk("data: 1")]));
+
+    await fetchEventSource("http://test/sse", {
+      fetch: mockFetch,
+      signal: controller.signal,
+      onOpen,
+      onClose,
+      async classifyResponse() {
+        // Abort while this async classifier is still pending.
+        controller.abort();
+        await Promise.resolve();
+        return FetchEventSourceDecision.Accept;
+      },
+    });
+
+    // The promise resolves on abort, but `create()` keeps running in the
+    // background. Flush microtasks/timers so an erroneous `onOpen` (the bug
+    // this guards) would have fired before we assert it did not.
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(onOpen).not.toHaveBeenCalled();
+    expect(onClose).toHaveBeenCalledWith({
+      reason: FetchEventSourceCloseReason.Aborted,
+      receiveState: ReceiveState.IDLE,
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Regression (M3): hiding the page mid-stream must abort the active request
+  // without reporting an aborted close, and resume on becoming visible again.
+  // -----------------------------------------------------------------------
+
+  it("pauses an active stream when hidden and resumes when visible without an aborted close", async () => {
+    const mockDocument = installMockDocument();
+    const onClose = vi.fn();
+    const messages: string[] = [];
+    let firstAborted = false;
+    let callCount = 0;
+    const mockFetch = vi
+      .fn()
+      .mockImplementation((_input: string, init?: RequestInit) => {
+        callCount++;
+        const count = callCount;
+        const encoder = new TextEncoder();
+        let streamController:
+          | ReadableStreamDefaultController<Uint8Array>
+          | undefined;
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            streamController = controller;
+            controller.enqueue(encoder.encode(sseChunk(`data: conn${count}`)));
+            // The second (resumed) connection ends cleanly; the first stays
+            // open until the visibility-driven abort tears it down.
+            if (count === 2) controller.close();
+          },
+        });
+        init?.signal?.addEventListener(
+          "abort",
+          () => {
+            if (count === 1) firstAborted = true;
+            // Mimic fetch: aborting the signal errors the body.
+            streamController?.error(new DOMException("aborted", "AbortError"));
+          },
+          { once: true },
+        );
+        return Promise.resolve(
+          new Response(body, {
+            status: 200,
+            headers: { "content-type": EventStreamContentType },
+          }),
+        );
+      });
+
+    try {
+      const promise = fetchEventSource("http://test/sse", {
+        fetch: mockFetch,
+        onClose,
+        onMessage(ev) {
+          messages.push(ev.data);
+        },
+      });
+
+      // First connection opens and delivers a message.
+      await vi.waitFor(() => expect(messages).toContain("conn1"));
+
+      // Hide mid-stream: aborts the active request, must NOT report a close.
+      mockDocument.setHidden(true);
+      mockDocument.dispatchVisibilityChange();
+      await vi.waitFor(() => expect(firstAborted).toBe(true));
+      expect(onClose).not.toHaveBeenCalled();
+
+      // Reveal: reconnect.
+      mockDocument.setHidden(false);
+      mockDocument.dispatchVisibilityChange();
+
+      await promise;
+
+      expect(callCount).toBe(2);
+      expect(messages).toEqual(["conn1", "conn2"]);
+      // onClose fired once, for eof — never for the visibility pause.
+      expect(onClose).toHaveBeenCalledOnce();
+      expect(onClose).toHaveBeenCalledWith({
+        reason: FetchEventSourceCloseReason.Eof,
+        receiveState: ReceiveState.RECEIVED_NO_ID,
+      });
+    } finally {
+      mockDocument.restore();
+    }
+  });
+
+  // -----------------------------------------------------------------------
+  // Regression (Codex #1): on a fatal ResponseError, native fetch errors the
+  // body when its signal is aborted. The library must NOT abort the
+  // controller before rejecting, so the caller can still read the body.
+  // -----------------------------------------------------------------------
+
+  it("keeps the body readable after rejecting with ResponseError under native-fetch abort semantics", async () => {
+    const mockFetch = vi.fn().mockImplementation(
+      (_input: string, init?: RequestInit) => {
+        let streamController:
+          | ReadableStreamDefaultController<Uint8Array>
+          | undefined;
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            streamController = controller;
+            controller.enqueue(new TextEncoder().encode('{"error":"nope"}'));
+            controller.close();
+          },
+        });
+        // Mimic native fetch: aborting the request signal errors the body.
+        init?.signal?.addEventListener(
+          "abort",
+          () => streamController?.error(new DOMException("aborted", "AbortError")),
+          { once: true },
+        );
+        return Promise.resolve(
+          new Response(body, {
+            status: 401,
+            headers: { "content-type": "application/json" },
+          }),
+        );
+      },
+    );
+
+    let caught: unknown;
+    try {
+      await fetchEventSource("http://test/sse", { fetch: mockFetch });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(ResponseError);
+    const text = await (caught as ResponseError).response.text();
+    expect(text).toBe('{"error":"nope"}');
+  });
+
+  // -----------------------------------------------------------------------
+  // Regression (Codex #2 / heph round-3): abort during an async
+  // `classifyResponse` that returns Accept must not let `onOpen` fire.
+  // The retry/fatal branches have downstream guards, but the accept branch
+  // would otherwise fall straight into `await onOpen` on a cancelled stream.
+  // -----------------------------------------------------------------------
+
+  it("does not call onOpen when aborted during an async classifyResponse that returns Accept", async () => {
+    const controller = new AbortController();
+    const onOpen = vi.fn();
+    const onClose = vi.fn();
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValue(mockSSEResponse([sseChunk("data: 1")]));
+
+    await fetchEventSource("http://test/sse", {
+      fetch: mockFetch,
+      signal: controller.signal,
+      onOpen,
+      onClose,
+      async classifyResponse() {
+        controller.abort();
+        await Promise.resolve();
+        return FetchEventSourceDecision.Accept;
+      },
+    });
+
+    // onOpen would otherwise fire after the promise resolves; flush.
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(onOpen).not.toHaveBeenCalled();
+    expect(onClose).toHaveBeenCalledOnce();
+    expect(onClose).toHaveBeenCalledWith({
+      reason: FetchEventSourceCloseReason.Aborted,
+      receiveState: ReceiveState.IDLE,
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Regression (Codex #3): abort during an async onOpen must not let the
+  // read loop start and emit messages on an already-resolved promise.
+  // -----------------------------------------------------------------------
+
+  it("does not start the read loop when aborted during an async onOpen", async () => {
+    const controller = new AbortController();
+    const onMessage = vi.fn();
+    const onClose = vi.fn();
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValue(mockSSEResponse([sseChunk("data: 1")]));
+
+    await fetchEventSource("http://test/sse", {
+      fetch: mockFetch,
+      signal: controller.signal,
+      onMessage,
+      onClose,
+      async onOpen() {
+        controller.abort();
+        await Promise.resolve();
+      },
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(onMessage).not.toHaveBeenCalled();
+    expect(onClose).toHaveBeenCalledOnce();
+    expect(onClose).toHaveBeenCalledWith({
+      reason: FetchEventSourceCloseReason.Aborted,
+      receiveState: ReceiveState.IDLE,
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Regression (Codex round-3 High): an abort during an async classifyError
+  // that returns fatal must not let the stale error reject the promise after
+  // the abort path has resolved it.
+  // -----------------------------------------------------------------------
+
+  it("lets abort win over a late fatal classifyError verdict", async () => {
+    const controller = new AbortController();
+    const onClose = vi.fn(
+      () => new Promise<void>((resolve) => setTimeout(resolve, 5)),
+    );
+    let firstThrow = false;
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValue(mockSSEResponse([sseChunk("data: 1")]));
+
+    await expect(
+      fetchEventSource("http://test/sse", {
+        fetch: mockFetch,
+        signal: controller.signal,
+        onClose,
+        onMessage() {
+          if (!firstThrow) {
+            firstThrow = true;
+            throw new Error("boom");
+          }
+        },
+        async classifyError() {
+          controller.abort();
+          await Promise.resolve();
+          return FetchEventSourceDecision.Fatal;
+        },
+      }),
+    ).resolves.toBeUndefined();
+
+    expect(onClose).toHaveBeenCalledOnce();
+    expect(onClose).toHaveBeenCalledWith({
+      reason: FetchEventSourceCloseReason.Aborted,
+      receiveState: expect.any(String),
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Regression (Codex round-3 Medium reproduction): same race for
+  // `rejectKeepingResponse` — abort during async classifyResponse that would
+  // return fatal must not reject with ResponseError.
+  // -----------------------------------------------------------------------
+
+  it("lets abort win over a late fatal classifyResponse verdict", async () => {
+    const controller = new AbortController();
+    const onClose = vi.fn(
+      () => new Promise<void>((resolve) => setTimeout(resolve, 5)),
+    );
+    const mockFetch = vi.fn().mockResolvedValue(
+      new Response("nope", {
+        status: 401,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
+    await expect(
+      fetchEventSource("http://test/sse", {
+        fetch: mockFetch,
+        signal: controller.signal,
+        onClose,
+        async classifyResponse() {
+          controller.abort();
+          await Promise.resolve();
+          return FetchEventSourceDecision.Fatal;
+        },
+      }),
+    ).resolves.toBeUndefined();
+
+    expect(onClose).toHaveBeenCalledWith({
+      reason: FetchEventSourceCloseReason.Aborted,
+      receiveState: ReceiveState.IDLE,
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Regression (Low): default content-type check matches the media type by
+  // its boundary, not a raw prefix.
+  // -----------------------------------------------------------------------
+
+  it("accepts text/event-stream with parameters but rejects look-alike media types", async () => {
+    const messages: string[] = [];
+    await fetchEventSource("http://test/sse", {
+      fetch: vi.fn().mockResolvedValue(
+        mockSSEResponse([sseChunk("data: ok")], {
+          contentType: "text/event-stream; charset=utf-8",
+        }),
+      ),
+      onMessage(ev) {
+        messages.push(ev.data);
+      },
+    });
+    expect(messages).toEqual(["ok"]);
+
+    await expect(
+      fetchEventSource("http://test/sse", {
+        fetch: vi.fn().mockResolvedValue(
+          mockSSEResponse([sseChunk("data: no")], {
+            contentType: "text/event-streamevil",
+          }),
+        ),
+      }),
+    ).rejects.toBeInstanceOf(ResponseError);
+  });
 });
