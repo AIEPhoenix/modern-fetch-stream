@@ -5,6 +5,23 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Stop delivering buffered messages after cancellation and release the stream pipeline.
+- Ignore stale error-classifier results when a visibility pause cancels their connection.
+- Release response bodies when response classification throws before a retry.
+- Accept `signal: null` consistently with `RequestInit`.
+- Reject retries of one-shot request bodies with `FatalError` instead of repeatedly sending an unusable body.
+- Resolve CommonJS TypeScript consumers to the generated `.d.cts` entry.
+
+### Added
+
+- Support `Headers` and tuple arrays in `init.headers`.
+- Build before packing and verify packed ESM/CJS runtime and type entry points.
+- Run validation in CI on Node.js 18, 20, 22, and 24.
+
 ## [1.0.1] - 2026-06-02
 
 A bug-fix release focused on the connection state machine: every settle path,

@@ -1923,4 +1923,32 @@ describe("fetchEventSource", () => {
       }),
     ).rejects.toBeInstanceOf(ResponseError);
   });
+
+  it.each(["fatal", "throw"])("ignores a stale %s error classifier after a visibility pause", async (verdict) => {
+    const mockDocument = installMockDocument();
+    let attempts = 0;
+    const messages: string[] = [];
+    try {
+      await fetchEventSource("http://test/sse", {
+        fetch: async () => {
+          if (++attempts === 1) throw new Error("network failure");
+          return mockSSEResponse([sseChunk("data: resumed")]);
+        },
+        async classifyError() {
+          mockDocument.setHidden(true);
+          mockDocument.dispatchVisibilityChange();
+          await Promise.resolve();
+          mockDocument.setHidden(false);
+          mockDocument.dispatchVisibilityChange();
+          if (verdict === "throw") throw new Error("stale classifier failure");
+          return FetchEventSourceDecision.Fatal;
+        },
+        onMessage(event) { messages.push(event.data); },
+      });
+      expect(attempts).toBe(2);
+      expect(messages).toEqual(["resumed"]);
+    } finally {
+      mockDocument.restore();
+    }
+  });
 });

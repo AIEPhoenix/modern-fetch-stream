@@ -111,6 +111,11 @@ export function fetchEventSource(
     let finished = false;
     /** Guards `onClose` so it fires at most once per connection attempt. */
     let closeCalled = false;
+    let attempted = false;
+    // A Request exposes its body as a one-shot stream. Explicit reusable
+    // bodies (strings, blobs, FormData, etc.) can be sent again by fetch.
+    const body = rest.body ?? (input instanceof Request ? input.body : null);
+    const oneShotBody = body instanceof ReadableStream;
 
     // -----------------------------------------------------------------------
     // External abort signal handling
@@ -119,7 +124,7 @@ export function fetchEventSource(
     const externalSignals = [
       input instanceof Request ? input.signal : undefined,
       inputSignal,
-    ].filter((signal): signal is AbortSignal => signal !== undefined);
+    ].filter((signal): signal is AbortSignal => signal != null);
 
     // -----------------------------------------------------------------------
     // Cleanup helpers
@@ -371,7 +376,7 @@ export function fetchEventSource(
      * Route a runtime error through `classifyError` and either schedule
      * a retry or reject the promise.
      */
-    async function handleError(error: unknown) {
+    async function handleError(error: unknown, signal: AbortSignal) {
       const decision = normalizeRetryDecision(
         await classifyError(error, receiveState),
       );
@@ -380,7 +385,7 @@ export function fetchEventSource(
       // over a stale fatal/retry verdict. (Both `rejectOnce` and
       // `scheduleRetry` also guard on `finished`, but checking here keeps
       // the intent explicit.)
-      if (finished) return;
+      if (finished || signal.aborted) return;
 
       if (decision.type === "fatal") {
         rejectOnce(error);
@@ -410,7 +415,17 @@ export function fetchEventSource(
     async function create() {
       if (finished) return;
 
+      if (attempted && oneShotBody) {
+        rejectOnce(new FatalError(
+          "Cannot retry a one-shot request body. Use a URL with a reusable init.body (such as a string or Blob).",
+        ));
+        return;
+      }
+      attempted = true;
+
       const controller = new AbortController();
+      let response: Response | undefined;
+      let keepResponse = false;
       isCreating = true;
       curRequestController = controller;
       receiveState = ReceiveState.IDLE;
@@ -420,11 +435,16 @@ export function fetchEventSource(
       closeCalled = false;
 
       try {
-        const response = await fetch(input, {
+        response = await fetch(input, {
           ...rest,
           headers,
           signal: controller.signal,
         });
+
+        if (finished || controller.signal.aborted) {
+          await disposeResponse(response);
+          return;
+        }
 
         // --- Phase 1: classify the HTTP response ---
         const responseDecision = normalizeResponseDecision(
@@ -443,20 +463,18 @@ export function fetchEventSource(
           return;
         }
 
+        keepResponse = responseDecision.type === "fatal";
         if (!(await applyResponseDecision(response, responseDecision))) {
           return;
         }
 
-        // --- Phase 2: notify the caller and begin streaming ---
-        try {
-          await onOpen?.(response);
-        } catch (error) {
-          // `onOpen` rejected on an accepted response whose body was never
-          // consumed. Cancel it so the connection is released before the
-          // error routes through `classifyError` (which may retry).
+        if (finished || controller.signal.aborted) {
           await disposeResponse(response);
-          throw error;
+          return;
         }
+
+        // --- Phase 2: notify the caller and begin streaming ---
+        await onOpen?.(response);
 
         // `onOpen` is also awaited — an abort during it must not let the
         // read loop start. Re-check once more before opening the pipeline.
@@ -484,10 +502,15 @@ export function fetchEventSource(
 
         // --- Phase 3: consume SSE messages ---
         const reader = eventStream.getReader();
+        // A custom fetch may not bind its response stream to the signal.
+        // Cancel directly even while an async message handler is pending.
+        const cancelReader = () => { void reader.cancel().catch(() => {}); };
+        controller.signal.addEventListener("abort", cancelReader, { once: true });
         try {
           for (;;) {
+            if (finished || controller.signal.aborted) break;
             const { done, value: event } = await reader.read();
-            if (done) break;
+            if (done || finished || controller.signal.aborted) break;
 
             // Track `last-event-id` for automatic resumption:
             //  - Non-empty id  → store it (RECEIVED).
@@ -508,14 +531,11 @@ export function fetchEventSource(
 
             await onMessage?.(event);
           }
-        } catch (error) {
-          // A read failure or `onMessage` rejection leaves the parser pipeline
-          // open. Cancel it — this propagates upstream to the response body,
-          // releasing the connection — before the error routes through
-          // `classifyError` (which may schedule a retry).
-          await reader.cancel().catch(() => {});
-          throw error;
         } finally {
+          controller.signal.removeEventListener("abort", cancelReader);
+          // Release buffered events and propagate cancellation upstream on
+          // every exit, including a caller abort during an async onMessage.
+          await reader.cancel().catch(() => {});
           reader.releaseLock();
         }
 
@@ -535,14 +555,19 @@ export function fetchEventSource(
         });
         resolveOnce();
       } catch (error) {
+        // Includes errors from response classification and pipeline setup,
+        // before a reader exists to take ownership of cancellation.
+        if (response && !keepResponse) await disposeResponse(response);
         if (!finished && !controller.signal.aborted) {
           try {
-            await handleError(error);
+            await handleError(error, controller.signal);
           } catch (innerError) {
-            rejectOnce(innerError);
+            if (!controller.signal.aborted) rejectOnce(innerError);
           }
         }
       } finally {
+        // Only fatal HTTP responses transfer their body to the caller.
+        if (!keepResponse) controller.abort();
         // Clear the controller reference if it still points to this attempt.
         if (curRequestController === controller) {
           curRequestController = undefined;

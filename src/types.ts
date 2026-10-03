@@ -101,15 +101,20 @@ export type ResponseDecision =
  * Options for {@link fetchEventSource}. Extends the standard `RequestInit`
  * with SSE-specific lifecycle callbacks and retry control.
  *
- * Headers are narrowed to `Record<string, string>` so the library can
- * transparently append the `last-event-id` header on reconnection.
+ * Headers are copied before adding the `last-event-id` header on reconnection.
  */
-export interface FetchEventSourceInit extends Omit<RequestInit, "headers"> {
+export interface FetchEventSourceInit extends RequestInit {
   /**
-   * Request headers. Only the `Record<string, string>` form is accepted
-   * because the library may append `last-event-id` for automatic resumption.
+   * Reusable bodies (strings, blobs, FormData, etc.) can be retried.
+   * A ReadableStream, including an inherited Request body, can only be sent
+   * once; a subsequent attempt rejects with FatalError without classifying it.
    */
-  headers?: Record<string, string>;
+  body?: BodyInit | null;
+
+  /**
+   * Request headers. Copied and normalized without mutating the input.
+   */
+  headers?: HeadersInit;
 
   /**
    * A custom `fetch` implementation. Defaults to `globalThis.fetch`.

@@ -146,7 +146,7 @@ fetch → classifyResponse → onOpen → [onMessage...] → onClose({ reason, r
 
 ## Key Design Decisions
 
-- Headers are typed as `Record<string, string>` (not `HeadersInit`) so the library can mutate them to append `last-event-id` on reconnection.
+- Headers accept `HeadersInit` and are copied into an internal record before adding `last-event-id` on reconnection.
 - Retry/fatal decisions are split into two classifiers: `classifyResponse` (HTTP-level) and `classifyError` (runtime-level). The old `onerror` callback was removed in 1.0.
 - `onMessage` can be async and is awaited serially (provides backpressure to the stream).
 - External abort resolves the promise (after calling `onClose({ reason: "aborted" })`), it does not reject. But if `onClose` throws on abort, the promise rejects directly (bypasses `classifyError`).
@@ -154,7 +154,7 @@ fetch → classifyResponse → onOpen → [onMessage...] → onClose({ reason, r
 
 ## Testing
 
-- **Unit tests** (`__tests__/client.spec.ts`, 36 tests): Mock fetch returning `ReadableStream<Uint8Array>` bodies. `mockSSEResponse()` and `sseChunk()` helpers simulate SSE streams. Retry tests use `vi.useFakeTimers()` + `vi.advanceTimersByTimeAsync()`. Visibility tests mock `document` with `installMockDocument()`.
+- **Unit tests** (`__tests__/*.spec.ts`): Mock fetch returning `ReadableStream<Uint8Array>` bodies, plus native-fetch lifecycle checks. `mockSSEResponse()` and `sseChunk()` helpers simulate SSE streams. Retry tests use `vi.useFakeTimers()` + `vi.advanceTimersByTimeAsync()`. Visibility tests mock `document` with `installMockDocument()`.
 - **E2E tests** (`test-server/`): A Hono server (`server.ts`) with ~11 endpoints simulating various SSE scenarios. Tests run via `tsx test-server/test.ts` using a custom harness (not vitest).
 
 ## Only Dependency

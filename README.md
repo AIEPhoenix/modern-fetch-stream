@@ -141,7 +141,7 @@ Extends the standard [`RequestInit`](https://developer.mozilla.org/en-US/docs/We
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `headers` | `Record<string, string>` | `{}` | Request headers. `accept: text/event-stream` is added automatically. |
+| `headers` | `HeadersInit` | `{}` | Request headers as a record, `Headers`, or tuple array. Copied before adding `accept: text/event-stream` automatically. |
 | `fetch` | `typeof fetch` | `globalThis.fetch` | Custom fetch implementation. |
 | `openWhenHidden` | `boolean` | `false` | Keep the connection alive when the page is hidden. |
 | `classifyResponse` | `(response) => ResponseDecision` | Accept only `2xx` `text/event-stream` responses | Decides whether a newly received response should be accepted, retried, or treated as fatal. |
@@ -313,7 +313,7 @@ await fetchEventSource('/api/stream', {
 })
 ```
 
-If `classifyResponse` returns `Retry`, `Fatal`, or `{ retryAfter }`, the current response is discarded immediately. Rejected responses become `ResponseError` instances when they terminate the stream.
+If `classifyResponse` returns `Retry` or `{ retryAfter }`, the current response body is cancelled before retrying. If it returns `Fatal`, the promise rejects with a `ResponseError` whose response body remains readable. The caller owns that body and should consume it (for example, `await error.response.text()`) or cancel it with `await error.response.body?.cancel()`.
 
 ```mermaid
 flowchart TD
@@ -323,7 +323,7 @@ flowchart TD
     D --> E["retry after current/server interval"]
     B -->|"{ retryAfter }"| F["discard response"]
     F --> G["retry after custom delay"]
-    B -->|"Fatal"| H["discard response"]
+    B -->|"Fatal"| H["transfer response to caller"]
     H --> I["reject with ResponseError"]
 ```
 
@@ -412,6 +412,22 @@ If your own `classifyError` or `RetriableError` does not specify `retryAfter`, t
 
 The library does not impose a built-in max retry count. If you want limits such as `maxRetries`, track that state outside the library and return `FetchEventSourceDecision.Fatal` when your policy is exhausted.
 
+### Request bodies and retries
+
+For requests that may reconnect, use a URL with a reusable `init.body`, such as a string, `Blob`, `FormData`, `URLSearchParams`, or byte buffer:
+
+```ts
+await fetchEventSource('/api/stream', {
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ prompt: 'Hello' }),
+})
+```
+
+A `Request` with a body, or a `ReadableStream` passed as `init.body`, is a one-shot input. The first attempt is supported. If another attempt is needed, including after a visibility pause, the promise rejects with `FatalError` before sending again. This replay failure bypasses `classifyError`, because retrying cannot restore the consumed body. The library does not buffer or clone streaming uploads. Set `openWhenHidden: true` if a one-shot request should continue while the page is hidden.
+
+Retries resend the request. For operations with side effects, make sure your server can safely handle repeated requests, for example with an idempotency key. Keep reusable bodies unchanged until the operation finishes.
+
 ```mermaid
 flowchart TD
     A["receive event with id"] --> B["store last-event-id"]
@@ -438,6 +454,16 @@ When you pass a `Request`:
 - Explicit `init` options take precedence over the `Request`'s properties.
 
 The library normalizes all header names to lowercase so it can safely manage `accept` and `last-event-id` without collisions.
+
+## Development checks
+
+```sh
+npm ci
+npm ci --prefix test-server
+npm run verify
+```
+
+`verify` runs type checks, unit and HTTP integration tests, and installs a freshly packed tarball in a temporary directory to check ESM/CJS runtime and TypeScript consumers. `npm pack` and `npm publish` rebuild `dist` through `prepack`. CI runs the same checks on Node.js 18, 20, 22, and 24.
 
 ## License
 
