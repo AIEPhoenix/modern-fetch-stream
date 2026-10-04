@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-10-04
+
 ### Fixed
 
 - Stop delivering buffered messages after cancellation and release the stream pipeline.
@@ -32,7 +34,7 @@ without changing the public API.
 - **Response cleanup after callback failures.** Cancel the response body when
   `onOpen` throws, and cancel the reader when a read or `onMessage` fails,
   before routing the error through `classifyError`. Cleanup for exceptions in
-  `classifyResponse` is listed separately under Unreleased.
+  `classifyResponse` was added in 1.0.2.
 - **`onClose` on EOF could deadlock the promise.** If a user-supplied
   `onClose` threw on an EOF close and a retry was queued, a subsequent
   external abort was silently swallowed by an internal `closeCalled` guard:
@@ -44,7 +46,7 @@ without changing the public API.
   `classifyResponse` that returned `accept`, the read loop would still
   proceed into `onOpen`. Re-check the abort state after `classifyResponse`
   and `onOpen` before starting the next phase. Suppressing buffered messages
-  after cancellation during `onMessage` is listed under Unreleased.
+  after cancellation during `onMessage` was added in 1.0.2.
 - **`ResponseError.response.body` is now actually readable.** The fatal-
   response path used to abort the fetch controller before rejecting, which
   errors the body under native `fetch` semantics and made

@@ -112,7 +112,7 @@ exploration. Use judgment; don't ceremony-wrap trivial work.
 
 `modern-fetch-stream` is an SSE (Server-Sent Events) client built on Fetch and Web Streams. It delegates parsing to `eventsource-parser`. The runtime must supply `Request`, `Headers`, `AbortController`, `ReadableStream`, `TransformStream`, and `TextDecoderStream` as well as fetch. CI covers Node.js 18, 20, 22, and 24; browser, Bun, and Deno compatibility is not covered by that matrix.
 
-The README describes `main`. Keep unpublished behavior under `Unreleased` in the changelog and distinguish it from the API available in the latest release.
+Keep the README version note aligned with the API it describes. Put unpublished behavior under `Unreleased` in the changelog and distinguish it from released behavior.
 
 ## Commands
 
