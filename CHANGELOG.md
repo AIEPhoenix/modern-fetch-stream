@@ -24,18 +24,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.0.1] - 2026-06-02
 
-A bug-fix release focused on the connection state machine: every settle path,
-abort race, and resource handle was audited and tightened. No public API
-changes; existing code keeps working.
+A bug-fix release addressing cancellation races and response-body cleanup,
+without changing the public API.
 
 ### Fixed
 
-- **Connection leak on errors during a live stream.** When `onMessage`,
-  `onOpen`, or `classifyResponse` threw after the response had been accepted,
-  the underlying HTTP stream was dropped without being cancelled and stayed
-  open until garbage collection. The read loop now cancels the reader (which
-  propagates upstream to the response body) before letting the error route
-  through `classifyError`.
+- **Response cleanup after callback failures.** Cancel the response body when
+  `onOpen` throws, and cancel the reader when a read or `onMessage` fails,
+  before routing the error through `classifyError`. Cleanup for exceptions in
+  `classifyResponse` is listed separately under Unreleased.
 - **`onClose` on EOF could deadlock the promise.** If a user-supplied
   `onClose` threw on an EOF close and a retry was queued, a subsequent
   external abort was silently swallowed by an internal `closeCalled` guard:
@@ -45,9 +42,9 @@ changes; existing code keeps working.
 - **`onOpen` could fire on a stream the caller had already cancelled.** When
   an external abort or page-visibility pause landed during an async
   `classifyResponse` that returned `accept`, the read loop would still
-  proceed into `onOpen` (and could ghost-fire `onMessage` after the returned
-  promise had resolved). The library now re-checks the abort/finished state
-  after every awaited user hook before continuing.
+  proceed into `onOpen`. Re-check the abort state after `classifyResponse`
+  and `onOpen` before starting the next phase. Suppressing buffered messages
+  after cancellation during `onMessage` is listed under Unreleased.
 - **`ResponseError.response.body` is now actually readable.** The fatal-
   response path used to abort the fetch controller before rejecting, which
   errors the body under native `fetch` semantics and made
@@ -55,8 +52,9 @@ changes; existing code keeps working.
   to the caller intact; ownership of the body transfers with the error.
 - **Stale errors could race past an in-flight abort.** When an external abort
   landed while an async `classifyError` was still resolving, the late fatal
-  verdict could reject the promise after the abort had already resolved it.
-  Every settle entry point now checks the terminal flag before committing.
+  verdict could reject the promise while the abort path was awaiting
+  `onClose`. The fatal rejection helpers now check the terminal flag so that
+  stale errors do not override caller cancellation.
 - **Default `Content-Type` check no longer over-matches.** The previous
   `startsWith("text/event-stream")` check would accept look-alike media
   types such as `text/event-streamevil`. The check now parses the media
@@ -65,10 +63,8 @@ changes; existing code keeps working.
 
 ### Added
 
-- **`engines.node >= 18`** in `package.json` so npm warns users on
-  unsupported Node versions; the library depends on `fetch`,
-  `ReadableStream`, and `TextDecoderStream`, all of which stabilized in
-  Node 18.
+- **`engines.node >= 18`** in `package.json` to declare the minimum Node.js
+  version. The client uses the runtime's Fetch and Web Streams APIs.
 - **`src/` is now published in the tarball** so the shipped source maps
   resolve to real files.
 - **Documented `Request`-input reconnection caveat.** A `Request` with a
@@ -83,5 +79,3 @@ changes; existing code keeps working.
   now called out in the source.
 - No public API changes. Internal helpers (`rejectKeepingResponse`, extra
   abort re-checks) are not exported.
-</content>
-</invoke>

@@ -23,9 +23,10 @@ export abstract class FetchEventSourceError extends Error {
 /**
  * An HTTP response that was not accepted by `classifyResponse`.
  *
- * Wraps the original `Response` object so callers can inspect status,
- * headers, or body after the fact. Treated as fatal by the default
- * `classifyError` implementation.
+ * The library rejects directly with this error on a fatal response decision,
+ * bypassing classifyError. The caller owns the response body and should read
+ * or cancel it. If thrown by a callback, it is fatal under the default error
+ * policy.
  */
 export class ResponseError extends FetchEventSourceError {
   readonly code = "RESPONSE_ERROR";
@@ -40,9 +41,9 @@ export class ResponseError extends FetchEventSourceError {
 }
 
 /**
- * Signals that the error is unrecoverable and the library should stop
- * retrying immediately. Throw this inside callbacks (e.g. `onMessage`)
- * to abort the stream.
+ * Stops retrying under the default error policy when thrown by a callback.
+ * A custom classifyError may choose a different policy. The library also
+ * rejects directly with this error when a one-shot body cannot be replayed.
  */
 export class FatalError extends FetchEventSourceError {
   readonly code = "FATAL_ERROR";
@@ -53,11 +54,13 @@ export class FatalError extends FetchEventSourceError {
 }
 
 /**
- * Signals that the error is transient and the library should reconnect.
+ * Requests reconnection under the default error policy.
  *
  * An optional `retryAfter` (ms) overrides the current retry interval for
  * the next reconnection attempt only. When omitted, the library falls back
- * to the server-sent `retry:` interval or the 1 000 ms default.
+ * to the server-sent `retry:` interval or the 1 000 ms default. A custom
+ * classifyError decides whether to honor this delay. Throwing on caller
+ * cancellation rejects directly rather than reconnecting.
  */
 export class RetriableError extends FetchEventSourceError {
   readonly code = "RETRIABLE_ERROR";

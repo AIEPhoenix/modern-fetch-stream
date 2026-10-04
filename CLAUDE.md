@@ -110,23 +110,29 @@ exploration. Use judgment; don't ceremony-wrap trivial work.
 
 ## Project Overview
 
-`modern-fetch-stream` is a lightweight SSE (Server-Sent Events) client built on the Fetch API. It delegates SSE parsing to the spec-compliant `eventsource-parser` library. Runs anywhere `fetch` is available (browsers, Node.js 18+, Bun, Deno).
+`modern-fetch-stream` is an SSE (Server-Sent Events) client built on Fetch and Web Streams. It delegates parsing to `eventsource-parser`. The runtime must supply `Request`, `Headers`, `AbortController`, `ReadableStream`, `TransformStream`, and `TextDecoderStream` as well as fetch. CI covers Node.js 18, 20, 22, and 24; browser, Bun, and Deno compatibility is not covered by that matrix.
+
+The README describes `main`. Keep unpublished behavior under `Unreleased` in the changelog and distinguish it from the API available in the latest release.
 
 ## Commands
 
-- **Build:** `npm run build` (tsup → ESM + CJS + .d.ts in `dist/`)
+- **Install:** `npm ci` and `npm ci --prefix test-server`
+- **Build:** `npm run build` (tsup → ESM, CJS, `.d.ts`, and `.d.cts` in `dist/`)
 - **Type check:** `npm run check` (tsc --noEmit)
 - **Unit tests:** `npm run test` (vitest run)
 - **Single test:** `npx vitest run __tests__/client.spec.ts`
 - **Watch tests:** `npm run test:watch`
 - **E2E tests:** `npm run test:e2e` (starts a Hono server in `test-server/`, runs integration tests)
 - **All tests:** `npm run test:all` (unit + e2e)
+- **Package check:** `npm run test:package` (pack, install in a temporary consumer, verify ESM/CJS runtime and types; requires registry access)
+- **Full validation:** `npm run verify` (type check + all tests + package check)
+- **Pack:** `npm pack` rebuilds via `prepack`; it does not run full validation.
 
 ## Architecture
 
 Five source files, single entry point (`src/index.ts` barrel export):
 
-- **`src/client.ts`** — Core `fetchEventSource()` function. A closure-based state machine inside `new Promise()` that implements the fetch → classify → stream → retry loop. Key internal state flags: `isCreating` (fetch in-flight), `pendingCreate` (retry queued), `finished` (terminal), `closeCalled` (onClose guard). Pipes `Response.body` through `TextDecoderStream` → `EventSourceParserStream`. Tracks `last-event-id` for automatic reconnection.
+- **`src/client.ts`** — Core `fetchEventSource()` function. A closure-based state machine implementing fetch → classify → stream → close or retry. `isCreating` covers the entire attempt, including awaited callbacks; `pendingCreate` queues a connection; `finished` marks termination; `closeCalled` guards each attempt's close callback; `attempted` prevents replaying a one-shot body. Pipes `Response.body` through `TextDecoderStream` → `EventSourceParserStream` and tracks `last-event-id`.
 - **`src/types.ts`** — `FetchEventSourceInit` interface (extends `RequestInit` with SSE callbacks and classifiers), `ReceiveState` enum, `FetchEventSourceDecision` / `FetchEventSourceCloseReason` constant objects, and decision types (`ResponseDecision`, `ErrorDecision`). Re-exports `EventSourceMessage` from `eventsource-parser`.
 - **`src/errors.ts`** — `EventStreamContentType` constant, abstract `FetchEventSourceError` base class (uses `new.target.name` for correct subclass naming), and three concrete errors: `ResponseError` (wraps HTTP response), `FatalError`, `RetriableError` (with optional `retryAfter`).
 - **`src/visibility.ts`** — Browser page visibility handling via `visibilitychange` listener. Returns a no-op disposer in non-browser environments (`typeof document` check).
@@ -141,21 +147,26 @@ fetch → classifyResponse → onOpen → [onMessage...] → onClose({ reason, r
 - **`classifyResponse`** decides Accept / Retry / Fatal / `{ retryAfter }` for the HTTP response.
 - **`classifyError`** decides Retry / Fatal / `{ retryAfter }` for runtime failures.
 - **`onClose`** receives `reason` (`"eof"` or `"aborted"`) and `ReceiveState`.
-- EOF close errors route through `classifyError` (retriable); abort close errors reject directly.
-- External abort via `AbortSignal` resolves the promise (does not reject).
+- Normal EOF resolves after `onClose`; it does not automatically reconnect. EOF callback failures go through `classifyError`, which may retry or reject.
+- Caller cancellation normally awaits `onClose(aborted)` and resolves; an error from that callback rejects directly. If EOF already started `onClose`, cancellation resolves without calling or awaiting it again.
+- Fatal responses, runtime failures, and visibility pauses do not invoke `onClose`.
 
 ## Key Design Decisions
 
 - Headers accept `HeadersInit` and are copied into an internal record before adding `last-event-id` on reconnection.
 - Retry/fatal decisions are split into two classifiers: `classifyResponse` (HTTP-level) and `classifyError` (runtime-level). The old `onerror` callback was removed in 1.0.
 - `onMessage` can be async and is awaited serially (provides backpressure to the stream).
-- External abort resolves the promise (after calling `onClose({ reason: "aborted" })`), it does not reject. But if `onClose` throws on abort, the promise rejects directly (bypasses `classifyError`).
+- A fatal response transfers body ownership to the caller through `ResponseError`; keep that body readable. Retry and callback-error paths release the response body.
+- A Request's inherited body and explicit `ReadableStream` bodies are one-shot. A second attempt rejects directly with `FatalError`; reusable explicit bodies can override a Request body.
+- Receive state resets per attempt, while resume headers persist. The ID is updated before `onMessage` completes and is not an acknowledgement of application processing.
+- Cancellation suppresses future message callbacks, but cannot interrupt application work inside a pending callback.
 - `NormalizedRetryDecision` / `NormalizedResponseDecision` internal types convert user-facing unions into tagged discriminants for cleaner control flow.
 
 ## Testing
 
 - **Unit tests** (`__tests__/*.spec.ts`): Mock fetch returning `ReadableStream<Uint8Array>` bodies, plus native-fetch lifecycle checks. `mockSSEResponse()` and `sseChunk()` helpers simulate SSE streams. Retry tests use `vi.useFakeTimers()` + `vi.advanceTimersByTimeAsync()`. Visibility tests mock `document` with `installMockDocument()`.
-- **E2E tests** (`test-server/`): A Hono server (`server.ts`) with ~11 endpoints simulating various SSE scenarios. Tests run via `tsx test-server/test.ts` using a custom harness (not vitest).
+- **E2E tests** (`test-server/`): A Hono server (`server.ts`) with endpoints simulating SSE scenarios. Run with `npm run test:e2e`; its custom harness starts and stops a local server unless `BASE_URL` points to an external instance.
+- **Package tests** (`scripts/check-package.mjs`): Exercise the actual tarball in an isolated temporary consumer, including separate ESM and CommonJS type resolution.
 
 ## Only Dependency
 

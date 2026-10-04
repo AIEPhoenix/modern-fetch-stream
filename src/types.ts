@@ -7,13 +7,17 @@ export type { EventSourceMessage };
 // ---------------------------------------------------------------------------
 
 /**
- * Describes the data receive state of the SSE stream at close time.
+ * Describes messages delivered during the current connection attempt.
+ * Updated before onMessage runs; does not acknowledge application processing.
  *
- * - `IDLE`            — connection opened but no messages received yet.
- * - `RECEIVED`        — at least one message carried an `id`; `last-event-id` is set.
- * - `RECEIVED_NO_ID`  — messages were received but `last-event-id` is unset
- *                        (either no message had an `id`, or it was explicitly cleared
- *                        by the server sending an empty `id:` field).
+ * - `IDLE`            — no messages delivered in this attempt yet.
+ * - `RECEIVED`        — a message supplied a non-empty id that has not since
+ *                        been cleared by an empty id.
+ * - `RECEIVED_NO_ID`  — messages arrived without establishing a non-empty id,
+ *                        or a later message cleared that id.
+ *
+ * State resets on each attempt. A resume header from the caller or an earlier
+ * attempt can still exist while state is IDLE or RECEIVED_NO_ID.
  */
 export enum ReceiveState {
   IDLE = "IDLE",
@@ -75,7 +79,8 @@ export interface FetchEventSourceClose {
  *
  * - `"retry"` — reconnect using the current interval.
  * - `"fatal"` — give up.
- * - `{ retryAfter: number }` — reconnect after a specific delay (ms).
+ * - `{ retryAfter: number }` — override the next delay in milliseconds;
+ *   must be finite and non-negative. Does not change the server interval.
  */
 export type ErrorDecision =
   | Exclude<
@@ -123,8 +128,9 @@ export interface FetchEventSourceInit extends RequestInit {
   fetch?: typeof globalThis.fetch;
 
   /**
-   * By default the connection is closed when the page becomes hidden
-   * and re-established when it becomes visible again (browser only).
+   * By default requests wait while the page is hidden. Hiding cancels the
+   * current request and retry timer; becoming visible requests a new attempt.
+   * Visibility pauses do not call onClose or settle the operation.
    * Set this to `true` to keep the connection alive regardless of
    * visibility state. Has no effect in non-browser environments.
    */
@@ -142,8 +148,8 @@ export interface FetchEventSourceInit extends RequestInit {
   ) => ResponseDecision | Promise<ResponseDecision>;
 
   /**
-   * Called after `classifyResponse` accepts the response, right before
-   * the response body starts streaming.
+   * Called after `classifyResponse` accepts the response, before the library
+   * reads it. Leave its body unread and unlocked for the SSE reader.
    */
   onOpen?: (response: Response) => void | Promise<void>;
 
@@ -158,11 +164,15 @@ export interface FetchEventSourceInit extends RequestInit {
   onMessage?: (ev: EventSourceMessage) => void | Promise<void>;
 
   /**
-   * Called when the SSE request closes.
+   * Called on normal EOF or caller cancellation, at most once per attempt.
+   * Fatal responses, runtime failures, and visibility pauses do not call it.
    *
    * For `reason: "eof"`, thrown or rejected values are routed through
    * `classifyError`. For `reason: "aborted"`, thrown or rejected values
    * reject the returned promise directly.
+   * Normal EOF resolves unless this callback throws or rejects.
+   * If EOF already started this callback, a later caller abort resolves
+   * without invoking it again or waiting for the existing callback.
    *
    * The callback receives the close reason and the final
    * {@link ReceiveState} at the time of close.

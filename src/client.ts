@@ -51,8 +51,8 @@ type NormalizedResponseDecision =
  *
  * @param input - The resource to fetch (URL string, `Request`, or `URL`).
  * @param init  - Fetch options extended with SSE lifecycle callbacks.
- * @returns A promise that resolves when the stream closes cleanly, or
- *          rejects when an unrecoverable error occurs.
+ * @returns A promise covering all attempts. Normal EOF and caller cancellation
+ *          resolve; fatal decisions and errors in an abort-close callback reject.
  */
 export function fetchEventSource(
   input: RequestInfo | URL,
@@ -588,8 +588,9 @@ export function fetchEventSource(
 // ---------------------------------------------------------------------------
 
 /**
- * Default response policy: accept only `2xx` responses whose `Content-Type`
- * starts with `text/event-stream`. Everything else is treated as fatal.
+ * Default response policy: accept only `2xx` responses with the
+ * `text/event-stream` media type (case-insensitive, parameters allowed).
+ * Everything else is treated as fatal.
  */
 function defaultClassifyResponse(response: Response): ResponseDecision {
   // Compare the media type by its `;`-delimited boundary (case-insensitively)
