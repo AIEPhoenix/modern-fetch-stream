@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.0.2] - 2026-10-04
+## [1.0.2] - 2026-10-08
 
 ### Fixed
 
@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Support `Headers` and tuple arrays in `init.headers`.
 - Build before packing and verify packed ESM/CJS runtime and type entry points.
 - Run validation in CI on Node.js 18, 20, 22, and 24.
+- Publish to npm and create the GitHub release from GitHub Actions when a version tag is pushed.
 
 ## [1.0.1] - 2026-06-02
 

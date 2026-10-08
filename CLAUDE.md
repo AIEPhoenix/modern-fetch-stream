@@ -127,6 +127,7 @@ Keep the README version note aligned with the API it describes. Put unpublished 
 - **Package check:** `npm run test:package` (pack, install in a temporary consumer, verify ESM/CJS runtime and types; requires registry access)
 - **Full validation:** `npm run verify` (type check + all tests + package check)
 - **Pack:** `npm pack` rebuilds via `prepack`; it does not run full validation.
+- **Release:** bump `version` in `package.json`, move the `Unreleased` changelog entries under the new version, update the README version note, commit, then push a bare semver tag such as `1.0.2`. `.github/workflows/release.yml` reruns CI, publishes to npm through trusted publishing (OIDC, no token), and creates the GitHub release from that changelog section. Nothing is published from a developer machine.
 
 ## Architecture
 
