@@ -8,7 +8,7 @@
 
 A fetch-based Server-Sent Events (SSE) client with POST support, custom headers, configurable retries, and `last-event-id` tracking. Parsing is handled by [`eventsource-parser`](https://github.com/rexxars/eventsource-parser).
 
-> This README describes version 1.0.2. See the [changelog](https://github.com/AIEPhoenix/modern-fetch-stream/blob/main/CHANGELOG.md#102---2026-10-08) for the fixes and additions in this release.
+> This README describes version 1.0.3. See the [changelog](https://github.com/AIEPhoenix/modern-fetch-stream/blob/main/CHANGELOG.md#103---2026-10-08) for the fixes and additions in this release.
 
 ## Install
 
